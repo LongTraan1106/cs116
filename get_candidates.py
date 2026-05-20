@@ -7,6 +7,7 @@ import warnings
 import gc 
 import os
 import shutil
+from datetime import timedelta
 
 warnings.filterwarnings('ignore')
 
@@ -236,8 +237,9 @@ def _build_repeatable_items(item_lf):
         return set()
 
     keywords = [
-        "tÃ£", "bá»‰m", "sá»¯a", "khÄƒn", "Æ°á»›t", "nÃºm", "ty", "thá»±c pháº©m",
-        "Äƒn dáº·m", "bá»™t", "chÃ¡o", "dinh dÆ°á»¡ng",
+        "tã", "bỉm", "sữa", "khăn", "ướt",
+        "núm ty", "núm ti",
+        "thực phẩm", "ăn dặm", "bột", "cháo", "dinh dưỡng",
         "diaper", "milk", "wipe", "nipple", "food", "nutrition",
     ]
     haystack = pl.concat_str(
@@ -261,6 +263,157 @@ def _build_repeatable_items(item_lf):
     print(f"   -> Repeatable consumable items detected: {len(repeatable_items)}")
     return set(repeatable_items)
 
+
+def _purchase_history_lf(transaction_lf, q_hist):
+    hist = transaction_lf.filter(pl.sql_expr(q_hist))
+    try:
+        cols = hist.collect_schema().names()
+    except Exception:
+        cols = hist.limit(1).collect().columns
+    if "event_type" in cols:
+        hist = hist.filter(
+            pl.col("event_type")
+            .cast(pl.Utf8)
+            .str.to_lowercase()
+            .str.replace_all("-", "_")
+            == "purchase"
+        )
+    return hist
+
+
+def _build_category_candidate_maps(transaction_lf, item_lf, q_hist, max_user_categories=3, max_category_items=50):
+    if item_lf is None:
+        return {}, {}
+
+    try:
+        item_cols = item_lf.collect_schema().names()
+    except Exception:
+        item_cols = item_lf.limit(1).collect().columns
+
+    category_col = next((c for c in ["category_l3", "category", "category_l4"] if c in item_cols), None)
+    if "item_id" not in item_cols or category_col is None:
+        return {}, {}
+
+    print("   -> Building category-trending candidate maps...")
+    item_cats = (
+        item_lf
+        .select([
+            pl.col("item_id").cast(pl.Utf8).str.strip_chars().alias("item_id"),
+            pl.col(category_col).cast(pl.Utf8).fill_null("unknown").alias("category_key"),
+        ])
+        .filter(pl.col("category_key") != "unknown")
+        .unique()
+    )
+
+    purchase_hist = (
+        _purchase_history_lf(transaction_lf, q_hist)
+        .select([
+            pl.col("customer_id"),
+            pl.col("item_id").cast(pl.Utf8).str.strip_chars().alias("item_id"),
+            pl.col("created_date"),
+        ])
+        .join(item_cats, on="item_id", how="inner")
+    )
+
+    user_cat_df = (
+        purchase_hist
+        .group_by(["customer_id", "category_key"])
+        .agg([
+            pl.len().alias("cnt"),
+            pl.col("created_date").max().alias("last_date"),
+        ])
+        .sort(["customer_id", "cnt", "last_date", "category_key"], descending=[False, True, True, False])
+        .group_by("customer_id", maintain_order=True)
+        .head(max_user_categories)
+        .collect()
+    )
+    user_category_map = {}
+    for row in user_cat_df.to_dicts():
+        user_category_map.setdefault(row["customer_id"], []).append(
+            (row["category_key"], float(np.log1p(row["cnt"])))
+        )
+
+    cat_items_df = (
+        purchase_hist
+        .group_by(["category_key", "item_id"])
+        .agg([
+            pl.len().alias("cnt"),
+            pl.col("created_date").max().alias("last_date"),
+        ])
+        .sort(["category_key", "cnt", "last_date", "item_id"], descending=[False, True, True, False])
+        .group_by("category_key", maintain_order=True)
+        .head(max_category_items)
+        .collect()
+    )
+    category_items_map = {}
+    cat_seen = {}
+    for row in cat_items_df.to_dicts():
+        cat = row["category_key"]
+        rank = cat_seen.get(cat, 0) + 1
+        cat_seen[cat] = rank
+        item_score = float(np.log1p(row["cnt"])) / rank
+        category_items_map.setdefault(cat, []).append((row["item_id"], item_score))
+
+    return user_category_map, category_items_map
+
+
+def _build_repeat_candidate_map(transaction_lf, q_hist, repeatable_items, max_repeat_items_per_user=20):
+    if not repeatable_items:
+        return {}
+
+    print("   -> Building repeat-purchase candidate map...")
+    repeat_df = (
+        _purchase_history_lf(transaction_lf, q_hist)
+        .select([
+            pl.col("customer_id"),
+            pl.col("item_id").cast(pl.Utf8).str.strip_chars().alias("item_id"),
+            pl.col("created_date"),
+        ])
+        .filter(pl.col("item_id").is_in(list(repeatable_items)))
+        .group_by(["customer_id", "item_id"])
+        .agg([
+            pl.len().alias("cnt"),
+            pl.col("created_date").max().alias("last_date"),
+        ])
+        .sort(["customer_id", "cnt", "last_date", "item_id"], descending=[False, True, True, False])
+        .group_by("customer_id", maintain_order=True)
+        .head(max_repeat_items_per_user)
+        .collect()
+    )
+
+    repeat_map = {}
+    for row in repeat_df.to_dicts():
+        repeat_map.setdefault(row["customer_id"], []).append(
+            (row["item_id"], float(np.log1p(row["cnt"])))
+        )
+    return repeat_map
+
+
+def get_recent_trending_items(transaction_lf, q_hist, n_trend=100, recent_days=60):
+    if n_trend == 0:
+        return []
+
+    hist = transaction_lf.filter(pl.sql_expr(q_hist))
+    anchor_df = hist.select(pl.col("created_date").max().alias("anchor")).collect()
+    if anchor_df.height == 0 or anchor_df["anchor"][0] is None:
+        return []
+
+    anchor = anchor_df["anchor"][0]
+    recent_start = anchor - timedelta(days=recent_days)
+    recent_items = (
+        hist
+        .filter(pl.col("created_date") > pl.lit(recent_start))
+        .group_by("item_id")
+        .agg(pl.len().alias("cnt"))
+        .sort(["cnt", "item_id"], descending=[True, False])
+        .limit(n_trend)
+        .select("item_id")
+        .collect()
+        .get_column("item_id")
+        .to_list()
+    )
+    return recent_items
+
 # --- 4. PRECOMPUTE (Giá»¯ nguyÃªn) ---
 def precompute_similarity_map(model, source_matrix, n_neighbors):
     n_items = source_matrix.shape[0]
@@ -269,10 +422,14 @@ def precompute_similarity_map(model, source_matrix, n_neighbors):
     for i in range(0, n_items, batch_size):
         end = min(i + batch_size, n_items)
         batch_vectors = source_matrix[i:end]
-        dists, indices = model.kneighbors(batch_vectors, n_neighbors=n_neighbors)
+        dists, indices = model.kneighbors(batch_vectors, n_neighbors=min(n_neighbors, n_items))
         for local_idx, neighbors in enumerate(indices):
             global_idx = i + local_idx
-            valid_neighbors = [n for n in neighbors if n != global_idx]
+            valid_neighbors = [
+                (int(n), max(0.0, 1.0 - float(dist)))
+                for n, dist in zip(neighbors, dists[local_idx])
+                if n != global_idx
+            ]
             sim_map[global_idx] = valid_neighbors
     return sim_map
 
@@ -295,6 +452,16 @@ def get_candidates(
     atc_seed_weight=3.0,
     view_seed_weight=1.0,
     allow_repeat_consumables=True,
+    enable_category_trending=True,
+    category_source_weight=2.5,
+    max_user_categories=3,
+    max_category_items=50,
+    enable_repeat_candidates=True,
+    repeat_source_weight=4.0,
+    max_repeat_items_per_user=20,
+    enable_recent_trending=True,
+    recent_trending_days=60,
+    recent_trending_weight=1.5,
 ):
     
     # Setup Temp Folder
@@ -304,6 +471,14 @@ def get_candidates(
     print(f">> Created temp dir for streaming: {temp_dir}")
 
     print(">> Getting Trending Items...")
+    recent_trend_items_list = []
+    if enable_recent_trending:
+        recent_trend_items_list = get_recent_trending_items(
+            transaction_lf,
+            q_hist,
+            n_trend=n_trend,
+            recent_days=recent_trending_days,
+        )
     trend_items_list = get_trending_items(
         transaction_lf,
         q_hist,
@@ -313,9 +488,28 @@ def get_candidates(
     )
     
     # Keep the ranked list for deterministic fallback order; use a set only for membership checks.
+    recent_trend_items_list = [str(x).strip() for x in recent_trend_items_list if x is not None]
     trend_items_list = [str(x).strip() for x in trend_items_list if x is not None]
+    recent_trend_items_set = set(recent_trend_items_list)
     trend_items_set = set(trend_items_list)
     repeatable_items = _build_repeatable_items(item_lf) if allow_repeat_consumables else set()
+    user_category_map, category_items_map = ({}, {})
+    if enable_category_trending:
+        user_category_map, category_items_map = _build_category_candidate_maps(
+            transaction_lf,
+            item_lf,
+            q_hist,
+            max_user_categories=max_user_categories,
+            max_category_items=max_category_items,
+        )
+    repeat_candidate_map = {}
+    if enable_repeat_candidates:
+        repeat_candidate_map = _build_repeat_candidate_map(
+            transaction_lf,
+            q_hist,
+            repeatable_items,
+            max_repeat_items_per_user=max_repeat_items_per_user,
+        )
 
     def _is_allowed_repeat(item_id, purchased_items_str):
         if item_id not in purchased_items_str:
@@ -326,12 +520,18 @@ def get_candidates(
         item: 1.0 / rank
         for rank, item in enumerate(trend_items_list, start=1)
     }
+    recent_trend_rank_score = {
+        item: recent_trending_weight / rank
+        for rank, item in enumerate(recent_trend_items_list, start=1)
+    }
 
     def _candidate_row(cust_id, item_id, rank, score, sources):
         source_purchase_cf = int("purchase_cf" in sources)
         source_atc_cf = int("atc_cf" in sources)
         source_view_cf = int("view_cf" in sources)
         source_trending = int("trending" in sources)
+        source_category_trending = int("category_trending" in sources)
+        source_repeat_purchase = int("repeat_purchase" in sources)
         return {
             "customer_id": cust_id,
             "item_id": item_id,
@@ -341,8 +541,15 @@ def get_candidates(
             "source_atc_cf": source_atc_cf,
             "source_view_cf": source_view_cf,
             "source_trending": source_trending,
+            "source_category_trending": source_category_trending,
+            "source_repeat_purchase": source_repeat_purchase,
             "num_candidate_sources": (
-                source_purchase_cf + source_atc_cf + source_view_cf + source_trending
+                source_purchase_cf
+                + source_atc_cf
+                + source_view_cf
+                + source_trending
+                + source_category_trending
+                + source_repeat_purchase
             ),
         }
 
@@ -408,9 +615,21 @@ def get_candidates(
             # Cold start logic: includes target customers that are absent from history.
             if (not is_known_user) or (len(recent_purchase_indices) == 0 and len(recent_view_indices) == 0 and len(recent_atc_indices) == 0):
                 ncold_start += 1
-                final_pool = [item for item in trend_items_list if _is_allowed_repeat(item, purchased_items_str)][:top_n]
+                cold_pool = []
+                for item in recent_trend_items_list + trend_items_list:
+                    if item not in cold_pool and _is_allowed_repeat(item, purchased_items_str):
+                        cold_pool.append(item)
+                    if len(cold_pool) >= top_n:
+                        break
+                final_pool = cold_pool[:top_n]
                 batch_results.extend([
-                    _candidate_row(cust_id, item, rank, trend_rank_score.get(item, 0.0), {"trending"})
+                    _candidate_row(
+                        cust_id,
+                        item,
+                        rank,
+                        recent_trend_rank_score.get(item, trend_rank_score.get(item, 0.0)),
+                        {"trending"},
+                    )
                     for rank, item in enumerate(final_pool, start=1)
                 ])
                 continue
@@ -434,15 +653,33 @@ def get_candidates(
                             seed_item = str(rev_item_mapping[item_idx]).strip()
                             rec_pool_score[seed_item] = rec_pool_score.get(seed_item, 0.0) + recency_weight * 0.5
                             rec_pool_sources.setdefault(seed_item, set()).add(source_name)
-                            for n_idx in neighbors:
+                            for n_idx, similarity in neighbors:
                                 if n_idx in rev_item_mapping:
                                     rec_item = str(rev_item_mapping[n_idx]).strip()
-                                    rec_pool_score[rec_item] = rec_pool_score.get(rec_item, 0.0) + recency_weight
+                                    rec_pool_score[rec_item] = rec_pool_score.get(rec_item, 0.0) + (recency_weight * similarity)
                                     rec_pool_sources.setdefault(rec_item, set()).add(source_name)
 
             if not rec_pool_score:
-                rec_pool_score = {item: 1.0 for item in trend_items_list}
-                rec_pool_sources = {item: {"trending"} for item in trend_items_list}
+                rec_pool_score = {
+                    item: recent_trend_rank_score.get(item, trend_rank_score.get(item, 0.0))
+                    for item in (recent_trend_items_list + trend_items_list)
+                }
+                rec_pool_sources = {item: {"trending"} for item in (recent_trend_items_list + trend_items_list)}
+
+            if enable_repeat_candidates:
+                for item, repeat_strength in repeat_candidate_map.get(cust_id, []):
+                    if item and item != "(not set)":
+                        rec_pool_score[item] = rec_pool_score.get(item, 0.0) + (repeat_source_weight * repeat_strength)
+                        rec_pool_sources.setdefault(item, set()).add("repeat_purchase")
+
+            if enable_category_trending:
+                for category_key, user_category_strength in user_category_map.get(cust_id, []):
+                    for item, item_category_score in category_items_map.get(category_key, []):
+                        if item and item != "(not set)":
+                            rec_pool_score[item] = rec_pool_score.get(item, 0.0) + (
+                                category_source_weight * user_category_strength * item_category_score
+                            )
+                            rec_pool_sources.setdefault(item, set()).add("category_trending")
 
             merged_pool = [
                 item for item, _ in sorted(rec_pool_score.items(), key=lambda x: (-x[1], x[0]))
@@ -456,24 +693,31 @@ def get_candidates(
             if len(merged_pool) < top_n:
                 seen_pool = set(merged_pool)
                 fallback_items = [
-                    item for item in trend_items_list
-                    if item in trend_items_set and item not in seen_pool and _is_allowed_repeat(item, purchased_items_str)
+                    item for item in (recent_trend_items_list + trend_items_list)
+                    if item not in seen_pool and _is_allowed_repeat(item, purchased_items_str)
                 ]
                 for item in fallback_items:
-                    rec_pool_score.setdefault(item, trend_rank_score.get(item, 0.0))
+                    rec_pool_score.setdefault(
+                        item,
+                        recent_trend_rank_score.get(item, trend_rank_score.get(item, 0.0)),
+                    )
                     rec_pool_sources.setdefault(item, set()).add("trending")
                 merged_pool.extend(fallback_items)
 
             final_pool = sorted(
                 merged_pool,
-                key=lambda item: (-rec_pool_score.get(item, trend_rank_score.get(item, 0.0)), item),
+                key=lambda item: (
+                    -rec_pool_score.get(item, trend_rank_score.get(item, 0.0)),
+                    -len(rec_pool_sources.get(item, set())),
+                    item,
+                ),
             )[:top_n]
             batch_results.extend([
                 _candidate_row(
                     cust_id,
                     item,
                     rank,
-                    rec_pool_score.get(item, trend_rank_score.get(item, 0.0)),
+                    rec_pool_score.get(item, recent_trend_rank_score.get(item, trend_rank_score.get(item, 0.0))),
                     rec_pool_sources.get(item, set()),
                 )
                 for rank, item in enumerate(final_pool, start=1)
@@ -487,6 +731,7 @@ def get_candidates(
             if invalid_count > 0:
                 print(f"   âš ï¸ Warning: Found {invalid_count} invalid item_ids, filtering them out")
                 df_chunk = df_chunk.filter(pl.col("item_id") != "(not set)")
+            df_chunk = df_chunk.filter(pl.col("item_id").is_not_null() & (pl.col("item_id") != ""))
             
             # Cast customer_id and item_id safely
             df_chunk = df_chunk.with_columns([
@@ -504,4 +749,28 @@ def get_candidates(
     gc.collect()
     
     print(">> Lazy Loading all chunks from disk...")
-    return pl.scan_parquet(f"{temp_dir}/*.parquet").collect()
+    result_df = pl.scan_parquet(f"{temp_dir}/*.parquet").collect()
+    if result_df.height > 0:
+        diag_cols = [
+            "source_purchase_cf",
+            "source_atc_cf",
+            "source_view_cf",
+            "source_trending",
+            "source_category_trending",
+            "source_repeat_purchase",
+        ]
+        stats = result_df.select([
+            pl.col("candidate_score").mean().alias("score_mean"),
+            pl.col("candidate_score").min().alias("score_min"),
+            pl.col("candidate_score").max().alias("score_max"),
+        ] + [
+            (pl.col(c).mean() * 100).alias(f"{c}_pct")
+            for c in diag_cols
+            if c in result_df.columns
+        ]).row(0, named=True)
+        print(">> Candidate diagnostics:")
+        print(f"   candidate_score mean/min/max: {stats['score_mean']:.4f}/{stats['score_min']:.4f}/{stats['score_max']:.4f}")
+        for key, value in stats.items():
+            if key.endswith("_pct"):
+                print(f"   {key.replace('_pct', '')}: {value:.2f}%")
+    return result_df

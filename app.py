@@ -8,16 +8,16 @@ import numpy as np
 import plotly.express as px 
 
 # NOTE: This dashboard is legacy/audit-only. The core pipeline now uses the
-# v8_candidate_features LightGBM Ranker flow; app.py may not reflect every
+# v10_smart_candidates LightGBM Ranker flow; app.py may not reflect every
 # current feature, split, or evaluation convention.
 
 # --- CẤU HÌNH ---
 DATA_DIR = "data/table"
 RES_PATH = "final_submission.parquet"
-GT_PATH = os.environ.get("GT_PATH", "data/groundtruth_test_dec2025_v8_candidate_features.pkl")
+GT_PATH = os.environ.get("GT_PATH", "data/groundtruth_test_dec2025_v10_smart_candidates.pkl")
 
-if os.path.exists("lgbm_model_v8_candidate_features.pkl"):
-    MODEL_PATH = "lgbm_model_v8_candidate_features.pkl"
+if os.path.exists("lgbm_model_v10_smart_candidates.pkl"):
+    MODEL_PATH = "lgbm_model_v10_smart_candidates.pkl"
 elif os.path.exists("lasso_model.pkl"):
     MODEL_PATH = "lasso_model.pkl"
 else:

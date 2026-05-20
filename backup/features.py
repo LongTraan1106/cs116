@@ -421,7 +421,7 @@ def generate_features(
         prepare_lookup_tables(transaction_lf, item_lf, q_hist, cfg, event_lf=event_lf)
     print(f"   [Marketing Features] Added {len(MARKETING_FEATURE_COLS)} purchase-only RFM/affinity/stickiness features")
 
-    batch_size = 1000000 
+    batch_size = 200000 
     total_rows = candidates_df.height
     pbar = tqdm(total=total_rows, desc=f"Vectorized {mode_name}")
     cand_lazy = candidates_df.lazy()

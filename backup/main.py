@@ -20,7 +20,7 @@ warnings.filterwarnings('ignore')
 # --- GLOBAL DECLARATION ---
 root_dir = 'data/'
 cache_tag = 'v11_rfm_affinity'
-candidate_cache_tag = 'v2026'
+candidate_cache_tag = 'v10_smart_candidates'
 
 try:
     if os.path.exists(root_dir):
@@ -675,19 +675,14 @@ def main():
             # --- STAGE 3: INFERENCE & HYBRID RERANKING ---
             print("\n--- STAGE 3: INFERENCE (HYBRID RERANKING) ---")
             print(">> [Phase 1] Generating predictions on candidates...")
-
-            # # Speed-up private inference: only rerank top 100 Stage-1 candidates/user
-            # df_candidates_infer = df_candidates.filter(pl.col("candidate_rank") <= 100)
-            # print(f"   Using top-100 inference candidates: {df_candidates_infer.height} / {df_candidates.height}")
-
             _ = feat.generate_features(
-                candidates_df=df_candidates,
+                candidates_df=df_candidates, 
                 transaction_lf=purchase_lf_processed,
                 item_lf=item_lf,
                 event_lf=event_lf_processed,
                 queries=queries,
                 cfg=cfg,
-                model=model,
+                model=model,           
                 feature_cols=feature_cols,
                 mode_name=f"inference_{cache_tag}",
                 feature_history_query=queries["inference_feature_history"],
@@ -881,10 +876,10 @@ def main():
 
         # --- STAGE 4: EXPORT & EVALUATION ---
         print("\n--- STAGE 4: EXPORT & EVALUATION ---")
-        json_path = "result_v11.json"
-        pkl_path = "result_v11.pkl"
-        eval_report_path = "evaluation_report_v11.json"
-        export_report_path = "export_report_v11.json"
+        json_path = "result.json"
+        pkl_path = "result.pkl"
+        eval_report_path = "evaluation_report.json"
+        export_report_path = "export_report.json"
         
         print(">> [Phase 1] Preparing submit-safe recommendations...")
         _print_recommendation_count_stats(df_final, "Before export preparation")

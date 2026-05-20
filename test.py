@@ -9,7 +9,7 @@ validation split stay aligned with the current time-aware pipeline.
 def main():
     print("test.py is deprecated.")
     print("Use:")
-    print("  python stage1_diagnostics.py --candidates candidates_val_v8_candidate_features.parquet")
+    print("  python stage1_diagnostics.py --candidates candidates_val_v10_smart_candidates.parquet")
 
 
 if __name__ == "__main__":

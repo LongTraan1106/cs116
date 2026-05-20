@@ -1,6 +1,6 @@
 # Ignore dataset files
 /data/
-
+/result/
 # Ignore Python cache files
 __pycache__/
 *.py[cod]
