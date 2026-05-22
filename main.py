@@ -19,7 +19,7 @@ warnings.filterwarnings('ignore')
 
 # --- GLOBAL DECLARATION ---
 root_dir = 'data/'
-cache_tag = 'v11_rfm_affinity'
+cache_tag = 'v13_replenishment_velocity_funnel'
 candidate_cache_tag = 'v2026'
 
 try:
@@ -445,14 +445,10 @@ def main():
                 "cooc_max",
                 "cooc_mean",
                 "cooc_len",
-                "brand_match",
-                "cat_l3_match",
-                "user_brand_count",
                 "days_since_last_brand_purchase",
                 "brand_cross_score",
                 "price_ratio",
                 "days_since_last_cat3_purchase",
-                "user_cat3_freq_log",
                 "user_recency_days",
                 "user_frequency_log",
                 "user_monetary_log",
@@ -465,6 +461,22 @@ def main():
                 "user_repeat_cat3_ratio",
                 "item_repeat_rate",
                 "cat3_repeat_rate",
+                "days_since_last_item_purchase",
+                "user_item_purchase_count",
+                "user_item_avg_repurchase_days",
+                "user_cat3_avg_repurchase_days",
+                "item_repurchase_due_score",
+                "cat3_repurchase_due_score",
+                "item_pop_30d",
+                "item_pop_prev30d",
+                "item_velocity_30d",
+                "cat3_pop_30d",
+                "cat3_pop_prev30d",
+                "cat3_velocity_30d",
+                "item_view_to_purchase_rate",
+                "item_atc_to_purchase_rate",
+                "cat3_view_to_purchase_rate",
+                "cat3_atc_to_purchase_rate",
                 "user_view_count_log",
                 "user_atc_count_log",
                 "user_view_unique_items_log",
@@ -486,6 +498,13 @@ def main():
                 "source_repeat_purchase",
                 "num_candidate_sources"
             ]
+            PRUNED_FEATURES = {
+                "brand_match",
+                "cat_l3_match",
+                "user_brand_count",
+                "user_cat3_freq_log",
+            }
+            assert not any(f in feature_cols for f in PRUNED_FEATURES)
 
             def load_or_generate_candidates(split_name, q_hist, target_customers=None):
                 save_path = f"candidates_{split_name}_{candidate_cache_tag}.parquet"

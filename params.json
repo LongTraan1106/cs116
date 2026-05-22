@@ -1,6 +1,6 @@
 {
   "date_col": "created_date",
-  "anchor_date": "2025-12-31",
+  "anchor_date": "2026-1-31",
   "len_hist": 365,
   "len_val": 30,
   "len_recent": 31,

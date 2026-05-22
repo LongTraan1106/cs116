@@ -43,6 +43,51 @@ MARKETING_FEATURE_COLS = [
     "cat3_repeat_rate",
 ]
 
+V13_FEATURE_COLS = [
+    "days_since_last_item_purchase",
+    "user_item_purchase_count",
+    "user_item_avg_repurchase_days",
+    "user_cat3_avg_repurchase_days",
+    "item_repurchase_due_score",
+    "cat3_repurchase_due_score",
+    "item_pop_30d",
+    "item_pop_prev30d",
+    "item_velocity_30d",
+    "cat3_pop_30d",
+    "cat3_pop_prev30d",
+    "cat3_velocity_30d",
+    "item_view_to_purchase_rate",
+    "item_atc_to_purchase_rate",
+    "cat3_view_to_purchase_rate",
+    "cat3_atc_to_purchase_rate",
+]
+
+V13_FEATURE_DEFAULTS = {
+    "days_since_last_item_purchase": 999,
+    "user_item_purchase_count": 0,
+    "user_item_avg_repurchase_days": 999,
+    "user_cat3_avg_repurchase_days": 999,
+    "item_repurchase_due_score": 0,
+    "cat3_repurchase_due_score": 0,
+    "item_pop_30d": 0,
+    "item_pop_prev30d": 0,
+    "item_velocity_30d": 0,
+    "cat3_pop_30d": 0,
+    "cat3_pop_prev30d": 0,
+    "cat3_velocity_30d": 0,
+    "item_view_to_purchase_rate": 0,
+    "item_atc_to_purchase_rate": 0,
+    "cat3_view_to_purchase_rate": 0,
+    "cat3_atc_to_purchase_rate": 0,
+}
+
+PRUNED_FEATURES = {
+    "brand_match",
+    "cat_l3_match",
+    "user_brand_count",
+    "user_cat3_freq_log",
+}
+
 # --- 1. PREPARE LOOKUP TABLES (FULL + TIME FEATURES) ---
 def prepare_lookup_tables(transaction_lf, item_lf, q_hist, cfg, event_lf=None):
     print(">> Preparing Lookup Tables (Vectorized)...")
@@ -153,6 +198,145 @@ def prepare_lookup_tables(transaction_lf, item_lf, q_hist, cfg, event_lf=None):
                 (pl.col("user_cat3_buy_count").fill_null(0) / (pl.col("user_purchase_count").fill_null(0) + 1)).alias("user_cat3_purchase_share")
             )
             .drop("user_purchase_count")
+            .collect()
+        )
+
+    print("   -> Computing v13 replenishment and velocity features...")
+    df_user_item_repurchase = (
+        hist_clean
+        .group_by(["customer_id", "item_id"])
+        .agg([
+            pl.len().alias("user_item_purchase_count"),
+            pl.col("created_date").min().alias("first_item_purchase_date"),
+            pl.col("created_date").max().alias("last_item_purchase_date"),
+        ])
+        .with_columns([
+            (pl.lit(anchor_date) - pl.col("last_item_purchase_date"))
+            .dt.total_days()
+            .cast(pl.Float32)
+            .alias("days_since_last_item_purchase"),
+            pl.when(pl.col("user_item_purchase_count") > 1)
+            .then(
+                (pl.col("last_item_purchase_date") - pl.col("first_item_purchase_date"))
+                .dt.total_days()
+                .cast(pl.Float32)
+                / (pl.col("user_item_purchase_count") - 1)
+            )
+            .otherwise(None)
+            .alias("user_item_avg_repurchase_days"),
+        ])
+        .select([
+            "customer_id",
+            "item_id",
+            "days_since_last_item_purchase",
+            "user_item_purchase_count",
+            "user_item_avg_repurchase_days",
+        ])
+        .collect()
+    )
+
+    df_user_cat3_repurchase = None
+    if item_cats is not None:
+        df_user_cat3_repurchase = (
+            hist_clean
+            .join(item_cats.lazy(), on="item_id", how="left")
+            .group_by(["customer_id", "category_l3"])
+            .agg([
+                pl.len().alias("cat3_purchase_count"),
+                pl.col("created_date").min().alias("min_cat3_date"),
+                pl.col("created_date").max().alias("max_cat3_date"),
+            ])
+            .with_columns(
+                pl.when(pl.col("cat3_purchase_count") > 1)
+                .then(
+                    (pl.col("max_cat3_date") - pl.col("min_cat3_date"))
+                    .dt.total_days()
+                    .cast(pl.Float32)
+                    / (pl.col("cat3_purchase_count") - 1)
+                )
+                .otherwise(None)
+                .alias("user_cat3_avg_repurchase_days")
+            )
+            .select(["customer_id", "category_l3", "user_cat3_avg_repurchase_days"])
+            .collect()
+        )
+
+    recent_30_start = anchor_date - datetime.timedelta(days=30) if anchor_date is not None else None
+    prev_30_start = anchor_date - datetime.timedelta(days=60) if anchor_date is not None else None
+    item_velocity_base = (
+        hist_clean
+        .with_columns([
+            (
+                (pl.col("created_date") > pl.lit(recent_30_start))
+                & (pl.col("created_date") <= pl.lit(anchor_date))
+            ).cast(pl.Int64).alias("is_item_recent_30"),
+            (
+                (pl.col("created_date") > pl.lit(prev_30_start))
+                & (pl.col("created_date") <= pl.lit(recent_30_start))
+            ).cast(pl.Int64).alias("is_item_prev_30"),
+        ])
+        .group_by("item_id")
+        .agg([
+            pl.col("is_item_recent_30").sum().alias("item_pop_30d"),
+            pl.col("is_item_prev_30").sum().alias("item_pop_prev30d"),
+        ])
+        .with_columns(
+            (
+                (pl.col("item_pop_30d").cast(pl.Float32) + 1).log()
+                / (pl.col("item_pop_prev30d").cast(pl.Float32) + 2).log()
+            )
+            .fill_null(0)
+            .alias("item_velocity_30d")
+        )
+    )
+    df_item_velocity = (
+        item_velocity_base
+        .with_columns(
+            pl.when(pl.col("item_velocity_30d") < 0).then(0)
+            .when(pl.col("item_velocity_30d") > 5).then(5)
+            .otherwise(pl.col("item_velocity_30d"))
+            .alias("item_velocity_30d")
+        )
+        .collect()
+    )
+
+    df_cat3_velocity = None
+    if item_cats is not None:
+        cat3_velocity_base = (
+            hist_clean
+            .join(item_cats.lazy(), on="item_id", how="left")
+            .with_columns([
+                (
+                    (pl.col("created_date") > pl.lit(recent_30_start))
+                    & (pl.col("created_date") <= pl.lit(anchor_date))
+                ).cast(pl.Int64).alias("is_cat3_recent_30"),
+                (
+                    (pl.col("created_date") > pl.lit(prev_30_start))
+                    & (pl.col("created_date") <= pl.lit(recent_30_start))
+                ).cast(pl.Int64).alias("is_cat3_prev_30"),
+            ])
+            .group_by("category_l3")
+            .agg([
+                pl.col("is_cat3_recent_30").sum().alias("cat3_pop_30d"),
+                pl.col("is_cat3_prev_30").sum().alias("cat3_pop_prev30d"),
+            ])
+            .with_columns(
+                (
+                    (pl.col("cat3_pop_30d").cast(pl.Float32) + 1).log()
+                    / (pl.col("cat3_pop_prev30d").cast(pl.Float32) + 2).log()
+                )
+                .fill_null(0)
+                .alias("cat3_velocity_30d")
+            )
+        )
+        df_cat3_velocity = (
+            cat3_velocity_base
+            .with_columns(
+                pl.when(pl.col("cat3_velocity_30d") < 0).then(0)
+                .when(pl.col("cat3_velocity_30d") > 5).then(5)
+                .otherwise(pl.col("cat3_velocity_30d"))
+                .alias("cat3_velocity_30d")
+            )
             .collect()
         )
 
@@ -314,6 +498,8 @@ def prepare_lookup_tables(transaction_lf, item_lf, q_hist, cfg, event_lf=None):
     print("   -> Preparing explicit view/ATC features...")
     df_user_event_stats = None
     df_user_item_event_stats = None
+    df_item_conversion = None
+    df_cat3_conversion = None
     if event_lf is not None:
         event_hist = (
             event_lf
@@ -356,6 +542,92 @@ def prepare_lookup_tables(transaction_lf, item_lf, q_hist, cfg, event_lf=None):
             .collect()
         )
 
+        item_purchase_counts = hist_clean.group_by("item_id").agg(pl.len().alias("item_purchase_count"))
+        item_event_counts = (
+            event_hist_flagged
+            .group_by("item_id")
+            .agg([
+                pl.col("is_view").sum().alias("item_view_count"),
+                pl.col("is_atc").sum().alias("item_atc_count"),
+            ])
+        )
+        df_item_conversion = (
+            item_purchase_counts
+            .join(item_event_counts, on="item_id", how="left")
+            .with_columns([
+                (
+                    pl.col("item_purchase_count")
+                    / (
+                        pl.col("item_view_count").fill_null(0)
+                        + pl.col("item_purchase_count")
+                        + 1
+                    )
+                ).alias("item_view_to_purchase_rate"),
+                (
+                    pl.col("item_purchase_count")
+                    / (
+                        pl.col("item_atc_count").fill_null(0)
+                        + pl.col("item_purchase_count")
+                        + 1
+                    )
+                ).alias("item_atc_to_purchase_rate"),
+            ])
+            .select(["item_id", "item_view_to_purchase_rate", "item_atc_to_purchase_rate"])
+            .collect()
+        )
+
+        if item_cats is not None:
+            cat3_purchase_counts = (
+                hist_clean
+                .join(item_cats.lazy(), on="item_id", how="left")
+                .group_by("category_l3")
+                .agg(pl.len().alias("cat3_purchase_count"))
+            )
+            cat3_event_counts = (
+                event_hist_flagged
+                .join(item_cats.lazy(), on="item_id", how="left")
+                .group_by("category_l3")
+                .agg([
+                    pl.col("is_view").sum().alias("cat3_view_count"),
+                    pl.col("is_atc").sum().alias("cat3_atc_count"),
+                ])
+            )
+            df_cat3_conversion = (
+                cat3_purchase_counts
+                .join(cat3_event_counts, on="category_l3", how="left")
+                .with_columns([
+                    (
+                        pl.col("cat3_purchase_count")
+                        / (
+                            pl.col("cat3_view_count").fill_null(0)
+                            + pl.col("cat3_purchase_count")
+                            + 1
+                        )
+                    ).alias("cat3_view_to_purchase_rate"),
+                    (
+                        pl.col("cat3_purchase_count")
+                        / (
+                            pl.col("cat3_atc_count").fill_null(0)
+                            + pl.col("cat3_purchase_count")
+                            + 1
+                        )
+                    ).alias("cat3_atc_to_purchase_rate"),
+                ])
+                .select(["category_l3", "cat3_view_to_purchase_rate", "cat3_atc_to_purchase_rate"])
+                .collect()
+            )
+
+    print("   [Replenishment/Velocity/Funnel] Added 16 v13 features")
+    print(
+        "      lookup rows: "
+        f"user_item_repurchase={df_user_item_repurchase.height if df_user_item_repurchase is not None else 0}, "
+        f"user_cat3_repurchase={df_user_cat3_repurchase.height if df_user_cat3_repurchase is not None else 0}, "
+        f"item_velocity={df_item_velocity.height if df_item_velocity is not None else 0}, "
+        f"cat3_velocity={df_cat3_velocity.height if df_cat3_velocity is not None else 0}, "
+        f"item_conversion={df_item_conversion.height if df_item_conversion is not None else 0}, "
+        f"cat3_conversion={df_cat3_conversion.height if df_cat3_conversion is not None else 0}"
+    )
+
     # 8. Item Info Metadata
     df_item = None
     if item_lf is not None:
@@ -366,7 +638,8 @@ def prepare_lookup_tables(transaction_lf, item_lf, q_hist, cfg, event_lf=None):
 
     return df_cooc, df_brand_cooc, df_hist_long, df_hist_brands_long, df_user_profile, \
             df_item_stats, df_brand_loyalty, anchor_date, df_item, user_spending, item_prices, cat_time_stats, df_user_event_stats, df_user_item_event_stats, \
-            df_user_rfm, df_user_stickiness, df_user_repeat_cat3, df_item_repeat_rate, df_cat3_repeat_rate
+            df_user_rfm, df_user_stickiness, df_user_repeat_cat3, df_item_repeat_rate, df_cat3_repeat_rate, \
+            df_user_item_repurchase, df_user_cat3_repurchase, df_item_velocity, df_cat3_velocity, df_item_conversion, df_cat3_conversion
 
 # --- 2. VECTORIZED GENERATION ---
 def generate_features(
@@ -417,7 +690,8 @@ def generate_features(
     # Unpack ALL tables
     df_cooc, df_brand_cooc, df_hist_long, df_hist_brands_long, df_user_profile, \
     df_item_stats, df_brand_loyalty, anchor_date, df_item, user_spending, item_prices, cat_time_stats, df_user_event_stats, df_user_item_event_stats, \
-    df_user_rfm, df_user_stickiness, df_user_repeat_cat3, df_item_repeat_rate, df_cat3_repeat_rate = \
+    df_user_rfm, df_user_stickiness, df_user_repeat_cat3, df_item_repeat_rate, df_cat3_repeat_rate, \
+    df_user_item_repurchase, df_user_cat3_repurchase, df_item_velocity, df_cat3_velocity, df_item_conversion, df_cat3_conversion = \
         prepare_lookup_tables(transaction_lf, item_lf, q_hist, cfg, event_lf=event_lf)
     print(f"   [Marketing Features] Added {len(MARKETING_FEATURE_COLS)} purchase-only RFM/affinity/stickiness features")
 
@@ -559,6 +833,54 @@ def generate_features(
         else:
             chunk_final = chunk_final.with_columns(pl.lit(0.0).alias("cat3_repeat_rate"))
 
+        if df_user_item_repurchase is not None:
+            chunk_final = chunk_final.join(df_user_item_repurchase, on=["customer_id", "item_id"], how="left")
+        else:
+            chunk_final = chunk_final.with_columns([
+                pl.lit(999).alias("days_since_last_item_purchase"),
+                pl.lit(0).alias("user_item_purchase_count"),
+                pl.lit(999).alias("user_item_avg_repurchase_days"),
+            ])
+
+        if df_user_cat3_repurchase is not None:
+            chunk_final = chunk_final.join(df_user_cat3_repurchase, on=["customer_id", "category_l3"], how="left")
+        else:
+            chunk_final = chunk_final.with_columns(pl.lit(999).alias("user_cat3_avg_repurchase_days"))
+
+        if df_item_velocity is not None:
+            chunk_final = chunk_final.join(df_item_velocity, on="item_id", how="left")
+        else:
+            chunk_final = chunk_final.with_columns([
+                pl.lit(0).alias("item_pop_30d"),
+                pl.lit(0).alias("item_pop_prev30d"),
+                pl.lit(0.0).alias("item_velocity_30d"),
+            ])
+
+        if df_cat3_velocity is not None:
+            chunk_final = chunk_final.join(df_cat3_velocity, on="category_l3", how="left")
+        else:
+            chunk_final = chunk_final.with_columns([
+                pl.lit(0).alias("cat3_pop_30d"),
+                pl.lit(0).alias("cat3_pop_prev30d"),
+                pl.lit(0.0).alias("cat3_velocity_30d"),
+            ])
+
+        if df_item_conversion is not None:
+            chunk_final = chunk_final.join(df_item_conversion, on="item_id", how="left")
+        else:
+            chunk_final = chunk_final.with_columns([
+                pl.lit(0.0).alias("item_view_to_purchase_rate"),
+                pl.lit(0.0).alias("item_atc_to_purchase_rate"),
+            ])
+
+        if df_cat3_conversion is not None:
+            chunk_final = chunk_final.join(df_cat3_conversion, on="category_l3", how="left")
+        else:
+            chunk_final = chunk_final.with_columns([
+                pl.lit(0.0).alias("cat3_view_to_purchase_rate"),
+                pl.lit(0.0).alias("cat3_atc_to_purchase_rate"),
+            ])
+
         # 6. Calc Features
         chunk_final = chunk_final.with_columns([
             pl.col("cooc_len").fill_null(0),
@@ -579,6 +901,11 @@ def generate_features(
             pl.col("user_repeat_cat3_ratio").fill_null(0),
             pl.col("item_repeat_rate").fill_null(0),
             pl.col("cat3_repeat_rate").fill_null(0),
+            *[
+                pl.col(c).fill_null(default)
+                for c, default in V13_FEATURE_DEFAULTS.items()
+                if c not in {"item_repurchase_due_score", "cat3_repurchase_due_score"}
+            ],
             
             (pl.col("global_item_count") + 1).log10().alias("item_pop_log"),
             (pl.col("price") - pl.col("user_avg_spend")).abs().alias("price_diff_abs"),
@@ -586,9 +913,7 @@ def generate_features(
 
             (anchor_date - pl.col("last_brand_purchase_date")).dt.total_days().fill_null(999).alias("days_since_last_brand_purchase"),
             
-            # [NEW] Days since cat purchase & Freq
             (anchor_date - pl.col("last_cat3_date")).dt.total_days().fill_null(999).alias("days_since_last_cat3_purchase"),
-            (pl.col("user_cat3_buy_count").fill_null(0) + 1).log10().alias("user_cat3_freq_log"),
 
             (pl.col("user_view_count").fill_null(0) + 1).log10().alias("user_view_count_log"),
             (pl.col("user_atc_count").fill_null(0) + 1).log10().alias("user_atc_count_log"),
@@ -601,20 +926,37 @@ def generate_features(
 
             (pl.col("user_item_view_count").fill_null(0) > 0).cast(pl.Int8).alias("view_item_match"),
             (pl.col("user_item_atc_count").fill_null(0) > 0).cast(pl.Int8).alias("atc_match"),
-
-            pl.when(pl.col("brand").is_in(pl.col("hist_brands"))).then(1).otherwise(0).alias("brand_match"),
-            pl.when(pl.col("category_l3").is_in(pl.col("hist_cats_l3"))).then(1).otherwise(0).alias("cat_l3_match")
         ])
 
         chunk_final = chunk_final.with_columns([
             ((pl.col("user_brand_count").fill_null(0) + 1).log() / (pl.col("days_since_last_brand_purchase").fill_null(999) + 3).log()).alias("brand_recency_x_freq"),
             ((pl.col("user_cat3_buy_count").fill_null(0) + 1).log() / (pl.col("days_since_last_cat3_purchase").fill_null(999) + 3).log()).alias("cat3_recency_x_freq"),
+            pl.when((pl.col("user_item_purchase_count") > 0) & (pl.col("user_item_avg_repurchase_days") < 999))
+            .then(pl.col("days_since_last_item_purchase") / (pl.col("user_item_avg_repurchase_days") + 1))
+            .otherwise(0)
+            .alias("_item_repurchase_due_score_raw"),
+            pl.when((pl.col("user_cat3_buy_count").fill_null(0) > 0) & (pl.col("user_cat3_avg_repurchase_days") < 999))
+            .then(pl.col("days_since_last_cat3_purchase") / (pl.col("user_cat3_avg_repurchase_days") + 1))
+            .otherwise(0)
+            .alias("_cat3_repurchase_due_score_raw"),
+        ])
+
+        chunk_final = chunk_final.with_columns([
+            pl.when(pl.col("_item_repurchase_due_score_raw") < 0).then(0)
+            .when(pl.col("_item_repurchase_due_score_raw") > 5).then(5)
+            .otherwise(pl.col("_item_repurchase_due_score_raw"))
+            .alias("item_repurchase_due_score"),
+            pl.when(pl.col("_cat3_repurchase_due_score_raw") < 0).then(0)
+            .when(pl.col("_cat3_repurchase_due_score_raw") > 5).then(5)
+            .otherwise(pl.col("_cat3_repurchase_due_score_raw"))
+            .alias("cat3_repurchase_due_score"),
         ])
         
         chunk_final = chunk_final.with_columns([
             pl.col("price_diff_abs").fill_null(99999),
             pl.col("price_ratio").fill_null(1.0),
             *[pl.col(c).fill_null(0) for c in MARKETING_FEATURE_COLS if c != "user_recency_days"],
+            *[pl.col(c).fill_null(default) for c, default in V13_FEATURE_DEFAULTS.items()],
             pl.col("user_recency_days").fill_null(999),
         ])
 
@@ -623,14 +965,10 @@ def generate_features(
             "cooc_max",
             "cooc_mean",
             "cooc_len",
-            "brand_match",
-            "cat_l3_match",
-            "user_brand_count",
             "days_since_last_brand_purchase",
             "brand_cross_score",
             "price_ratio",
             "days_since_last_cat3_purchase",
-            "user_cat3_freq_log",
             "user_recency_days",
             "user_frequency_log",
             "user_monetary_log",
@@ -643,6 +981,22 @@ def generate_features(
             "user_repeat_cat3_ratio",
             "item_repeat_rate",
             "cat3_repeat_rate",
+            "days_since_last_item_purchase",
+            "user_item_purchase_count",
+            "user_item_avg_repurchase_days",
+            "user_cat3_avg_repurchase_days",
+            "item_repurchase_due_score",
+            "cat3_repurchase_due_score",
+            "item_pop_30d",
+            "item_pop_prev30d",
+            "item_velocity_30d",
+            "cat3_pop_30d",
+            "cat3_pop_prev30d",
+            "cat3_velocity_30d",
+            "item_view_to_purchase_rate",
+            "item_atc_to_purchase_rate",
+            "cat3_view_to_purchase_rate",
+            "cat3_atc_to_purchase_rate",
             "user_view_count_log",
             "user_atc_count_log",
             "user_view_unique_items_log",
@@ -664,6 +1018,7 @@ def generate_features(
             "source_repeat_purchase",
             "num_candidate_sources"
         ]
+        assert not any(f in final_cols for f in PRUNED_FEATURES)
 
         
         if model is not None:
@@ -704,8 +1059,13 @@ def generate_features(
     # Cleanup
     del df_cooc, df_hist_long, df_user_profile, df_item, df_brand_loyalty, df_item_stats
     del df_user_rfm, df_user_stickiness, df_item_repeat_rate
+    del df_user_item_repurchase, df_item_velocity
     if 'df_user_repeat_cat3' in locals(): del df_user_repeat_cat3
     if 'df_cat3_repeat_rate' in locals(): del df_cat3_repeat_rate
+    if 'df_user_cat3_repurchase' in locals(): del df_user_cat3_repurchase
+    if 'df_cat3_velocity' in locals(): del df_cat3_velocity
+    if 'df_item_conversion' in locals(): del df_item_conversion
+    if 'df_cat3_conversion' in locals(): del df_cat3_conversion
     if 'cat_time_stats' in locals(): del cat_time_stats
     gc.collect()
 
