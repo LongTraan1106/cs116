@@ -19,8 +19,8 @@ warnings.filterwarnings('ignore')
 
 # --- GLOBAL DECLARATION ---
 root_dir = 'data/'
-cache_tag = 'v13_replenishment_velocity_funnel'
-candidate_cache_tag = 'v2026'
+cache_tag = 'v14a_repurchase_due_only'
+candidate_cache_tag = 'v14a_repurchase_due_only'
 
 try:
     if os.path.exists(root_dir):
@@ -156,6 +156,12 @@ CANDIDATE_FEATURE_DEFAULTS = {
     "source_trending": 0,
     "source_category_trending": 0,
     "source_repeat_purchase": 0,
+    "source_repurchase_due": 0,
+    "source_recent_velocity_30d": 0,
+    "source_high_conversion": 0,
+    "repurchase_due_source_score": 0.0,
+    "recent_velocity_source_score": 0.0,
+    "conversion_source_score": 0.0,
     "num_candidate_sources": 0,
 }
 
@@ -377,6 +383,18 @@ def main():
                 "enable_recent_trending": True,
                 "recent_trending_days": 60,
                 "recent_trending_weight": 1.5,
+                "enable_repurchase_due_candidates": True,
+                "repurchase_due_weight": 3.5,
+                "max_repurchase_due_items_per_user": 20,
+                "repurchase_due_min_days": 7,
+                "repurchase_due_max_days": 120,
+                "enable_recent_velocity_candidates": False,
+                "recent_velocity_weight": 1.25,
+                "max_recent_velocity_items": 200,
+                "enable_high_conversion_candidates": False,
+                "high_conversion_weight": 0.75,
+                "max_high_conversion_items": 200,
+                "min_conversion_purchase_count": 5,
             }
             stage2_cfg = {
                 "n_neg_per_pos": 5,
@@ -433,6 +451,18 @@ def main():
                     enable_recent_trending=stage1_cfg["enable_recent_trending"],
                     recent_trending_days=stage1_cfg["recent_trending_days"],
                     recent_trending_weight=stage1_cfg["recent_trending_weight"],
+                    enable_repurchase_due_candidates=stage1_cfg["enable_repurchase_due_candidates"],
+                    repurchase_due_weight=stage1_cfg["repurchase_due_weight"],
+                    max_repurchase_due_items_per_user=stage1_cfg["max_repurchase_due_items_per_user"],
+                    repurchase_due_min_days=stage1_cfg["repurchase_due_min_days"],
+                    repurchase_due_max_days=stage1_cfg["repurchase_due_max_days"],
+                    enable_recent_velocity_candidates=stage1_cfg["enable_recent_velocity_candidates"],
+                    recent_velocity_weight=stage1_cfg["recent_velocity_weight"],
+                    max_recent_velocity_items=stage1_cfg["max_recent_velocity_items"],
+                    enable_high_conversion_candidates=stage1_cfg["enable_high_conversion_candidates"],
+                    high_conversion_weight=stage1_cfg["high_conversion_weight"],
+                    max_high_conversion_items=stage1_cfg["max_high_conversion_items"],
+                    min_conversion_purchase_count=stage1_cfg["min_conversion_purchase_count"],
                 )
                 print(f"âœ… Generated {df_candidates.height} candidate records")
                 df_candidates.write_parquet(save_path_s1)
@@ -496,6 +526,8 @@ def main():
                 "source_trending",
                 "source_category_trending",
                 "source_repeat_purchase",
+                "source_repurchase_due",
+                "repurchase_due_source_score",
                 "num_candidate_sources"
             ]
             PRUNED_FEATURES = {
@@ -543,6 +575,18 @@ def main():
                     enable_recent_trending=stage1_cfg["enable_recent_trending"],
                     recent_trending_days=stage1_cfg["recent_trending_days"],
                     recent_trending_weight=stage1_cfg["recent_trending_weight"],
+                    enable_repurchase_due_candidates=stage1_cfg["enable_repurchase_due_candidates"],
+                    repurchase_due_weight=stage1_cfg["repurchase_due_weight"],
+                    max_repurchase_due_items_per_user=stage1_cfg["max_repurchase_due_items_per_user"],
+                    repurchase_due_min_days=stage1_cfg["repurchase_due_min_days"],
+                    repurchase_due_max_days=stage1_cfg["repurchase_due_max_days"],
+                    enable_recent_velocity_candidates=stage1_cfg["enable_recent_velocity_candidates"],
+                    recent_velocity_weight=stage1_cfg["recent_velocity_weight"],
+                    max_recent_velocity_items=stage1_cfg["max_recent_velocity_items"],
+                    enable_high_conversion_candidates=stage1_cfg["enable_high_conversion_candidates"],
+                    high_conversion_weight=stage1_cfg["high_conversion_weight"],
+                    max_high_conversion_items=stage1_cfg["max_high_conversion_items"],
+                    min_conversion_purchase_count=stage1_cfg["min_conversion_purchase_count"],
                 )
                 print(f"Generated {df.height} {split_name} candidate records")
                 df.write_parquet(save_path)

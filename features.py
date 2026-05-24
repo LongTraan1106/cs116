@@ -25,6 +25,12 @@ CANDIDATE_FEATURE_DEFAULTS = {
     "source_trending": 0,
     "source_category_trending": 0,
     "source_repeat_purchase": 0,
+    "source_repurchase_due": 0,
+    "source_recent_velocity_30d": 0,
+    "source_high_conversion": 0,
+    "repurchase_due_source_score": 0.0,
+    "recent_velocity_source_score": 0.0,
+    "conversion_source_score": 0.0,
     "num_candidate_sources": 0,
 }
 
@@ -1016,6 +1022,8 @@ def generate_features(
             "source_trending",
             "source_category_trending",
             "source_repeat_purchase",
+            "source_repurchase_due",
+            "repurchase_due_source_score",
             "num_candidate_sources"
         ]
         assert not any(f in final_cols for f in PRUNED_FEATURES)

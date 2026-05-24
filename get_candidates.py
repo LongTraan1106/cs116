@@ -389,6 +389,267 @@ def _build_repeat_candidate_map(transaction_lf, q_hist, repeatable_items, max_re
     return repeat_map
 
 
+def _build_repurchase_due_candidate_map(
+    transaction_lf,
+    q_hist,
+    repeatable_items,
+    max_repurchase_due_items_per_user=20,
+    repurchase_due_min_days=7,
+    repurchase_due_max_days=120,
+):
+    print("   -> Building repurchase-due candidate map...")
+    purchase_hist = (
+        _purchase_history_lf(transaction_lf, q_hist)
+        .select([
+            pl.col("customer_id"),
+            pl.col("item_id").cast(pl.Utf8).str.strip_chars().alias("item_id"),
+            pl.col("created_date"),
+        ])
+        .filter(
+            pl.col("item_id").is_not_null()
+            & (pl.col("item_id") != "")
+            & (pl.col("item_id") != "(not set)")
+        )
+    )
+    anchor_df = purchase_hist.select(pl.col("created_date").max().alias("anchor")).collect()
+    if anchor_df.height == 0 or anchor_df["anchor"][0] is None:
+        return {}
+
+    anchor = anchor_df["anchor"][0]
+    repurchase_lf = (
+        purchase_hist
+        .group_by(["customer_id", "item_id"])
+        .agg([
+            pl.len().alias("user_item_purchase_count"),
+            pl.col("created_date").min().alias("first_item_purchase_date"),
+            pl.col("created_date").max().alias("last_item_purchase_date"),
+        ])
+        .with_columns([
+            (pl.lit(anchor) - pl.col("last_item_purchase_date"))
+            .dt.total_days()
+            .cast(pl.Float32)
+            .alias("days_since_last_item_purchase"),
+            pl.when(pl.col("user_item_purchase_count") > 1)
+            .then(
+                (pl.col("last_item_purchase_date") - pl.col("first_item_purchase_date"))
+                .dt.total_days()
+                .cast(pl.Float32)
+                / (pl.col("user_item_purchase_count") - 1)
+            )
+            .otherwise(None)
+            .alias("avg_repurchase_days"),
+        ])
+        .filter(
+            (pl.col("days_since_last_item_purchase") >= repurchase_due_min_days)
+            & (pl.col("days_since_last_item_purchase") <= repurchase_due_max_days)
+        )
+    )
+    if repeatable_items:
+        repurchase_lf = repurchase_lf.filter(pl.col("item_id").is_in(list(repeatable_items)))
+
+    due_df = (
+        repurchase_lf
+        .with_columns([
+            (pl.col("user_item_purchase_count").cast(pl.Float32) + 1).log().alias("_base_score"),
+            pl.when(pl.col("avg_repurchase_days").is_not_null())
+            .then(pl.col("days_since_last_item_purchase") / (pl.col("avg_repurchase_days") + 1))
+            .otherwise(pl.col("days_since_last_item_purchase") / 30.0)
+            .alias("_due_ratio"),
+        ])
+        .with_columns(
+            pl.when(pl.col("avg_repurchase_days").is_not_null())
+            .then(
+                pl.col("_base_score")
+                * pl.when(pl.col("_due_ratio") < 0).then(0)
+                .when(pl.col("_due_ratio") > 3).then(3)
+                .otherwise(pl.col("_due_ratio"))
+            )
+            .otherwise(
+                pl.col("_base_score")
+                * pl.when(pl.col("_due_ratio") < 0).then(0)
+                .when(pl.col("_due_ratio") > 2).then(2)
+                .otherwise(pl.col("_due_ratio"))
+            )
+            .alias("_due_score")
+        )
+        .with_columns(
+            pl.when(pl.col("days_since_last_item_purchase") > 90)
+            .then(pl.col("_due_score") * 0.7)
+            .otherwise(pl.col("_due_score"))
+            .alias("due_score")
+        )
+        .sort(["customer_id", "due_score", "item_id"], descending=[False, True, False])
+        .group_by("customer_id", maintain_order=True)
+        .head(max_repurchase_due_items_per_user)
+        .select(["customer_id", "item_id", "due_score"])
+        .collect()
+    )
+
+    due_map = {}
+    for row in due_df.to_dicts():
+        due_map.setdefault(row["customer_id"], []).append((row["item_id"], float(row["due_score"] or 0.0)))
+    return due_map
+
+
+def _build_recent_velocity_candidate_map(transaction_lf, q_hist, max_recent_velocity_items=200):
+    print("   -> Building recent velocity candidate map...")
+    purchase_hist = (
+        _purchase_history_lf(transaction_lf, q_hist)
+        .select([
+            pl.col("item_id").cast(pl.Utf8).str.strip_chars().alias("item_id"),
+            pl.col("created_date"),
+        ])
+        .filter(
+            pl.col("item_id").is_not_null()
+            & (pl.col("item_id") != "")
+            & (pl.col("item_id") != "(not set)")
+        )
+    )
+    anchor_df = purchase_hist.select(pl.col("created_date").max().alias("anchor")).collect()
+    if anchor_df.height == 0 or anchor_df["anchor"][0] is None:
+        return [], {}
+
+    anchor = anchor_df["anchor"][0]
+    recent_30_start = anchor - timedelta(days=30)
+    prev_30_start = anchor - timedelta(days=60)
+    velocity_df = (
+        purchase_hist
+        .with_columns([
+            (
+                (pl.col("created_date") > pl.lit(recent_30_start))
+                & (pl.col("created_date") <= pl.lit(anchor))
+            ).cast(pl.Int64).alias("is_recent_30"),
+            (
+                (pl.col("created_date") > pl.lit(prev_30_start))
+                & (pl.col("created_date") <= pl.lit(recent_30_start))
+            ).cast(pl.Int64).alias("is_prev_30"),
+        ])
+        .group_by("item_id")
+        .agg([
+            pl.col("is_recent_30").sum().alias("item_pop_30d"),
+            pl.col("is_prev_30").sum().alias("item_pop_prev30d"),
+        ])
+        .filter(pl.col("item_pop_30d") > 0)
+        .with_columns(
+            (
+                (pl.col("item_pop_30d").cast(pl.Float32) + 1).log()
+                / (pl.col("item_pop_prev30d").cast(pl.Float32) + 2).log()
+            )
+            .fill_null(0)
+            .alias("_item_velocity_30d")
+        )
+        .with_columns(
+            pl.when(pl.col("_item_velocity_30d") > 5).then(5)
+            .when(pl.col("_item_velocity_30d") < 0).then(0)
+            .otherwise(pl.col("_item_velocity_30d"))
+            .alias("item_velocity_30d")
+        )
+        .with_columns(
+            ((pl.col("item_pop_30d").cast(pl.Float32) + 1).log() * pl.col("item_velocity_30d"))
+            .alias("recent_velocity_score")
+        )
+        .sort(["recent_velocity_score", "item_pop_30d", "item_id"], descending=[True, True, False])
+        .limit(max_recent_velocity_items)
+        .select(["item_id", "recent_velocity_score"])
+        .collect()
+    )
+
+    items = velocity_df.get_column("item_id").to_list() if velocity_df.height else []
+    score_map = {
+        row["item_id"]: float(row["recent_velocity_score"] or 0.0)
+        for row in velocity_df.to_dicts()
+    }
+    return items, score_map
+
+
+def _build_high_conversion_candidate_map(
+    transaction_lf,
+    event_lf,
+    q_hist,
+    max_high_conversion_items=200,
+    min_conversion_purchase_count=5,
+):
+    if event_lf is None:
+        return [], {}
+
+    print("   -> Building high-conversion candidate map...")
+    purchase_counts = (
+        _purchase_history_lf(transaction_lf, q_hist)
+        .select(pl.col("item_id").cast(pl.Utf8).str.strip_chars().alias("item_id"))
+        .filter(
+            pl.col("item_id").is_not_null()
+            & (pl.col("item_id") != "")
+            & (pl.col("item_id") != "(not set)")
+        )
+        .group_by("item_id")
+        .agg(pl.len().alias("item_purchase_count"))
+    )
+    event_hist = (
+        event_lf
+        .filter(pl.sql_expr(q_hist))
+        .select(["item_id", "event_type"])
+        .with_columns([
+            pl.col("item_id").cast(pl.Utf8).str.strip_chars().alias("item_id"),
+            pl.col("event_type")
+            .cast(pl.Utf8)
+            .str.to_lowercase()
+            .str.replace_all("-", "_")
+            .alias("event_type"),
+        ])
+        .filter(
+            pl.col("item_id").is_not_null()
+            & (pl.col("item_id") != "")
+            & (pl.col("item_id") != "(not set)")
+            & pl.col("event_type").is_in(["view_item", "add_to_cart"])
+        )
+        .with_columns([
+            (pl.col("event_type") == "view_item").cast(pl.Int64).alias("is_view"),
+            (pl.col("event_type") == "add_to_cart").cast(pl.Int64).alias("is_atc"),
+        ])
+        .group_by("item_id")
+        .agg([
+            pl.col("is_view").sum().alias("item_view_count"),
+            pl.col("is_atc").sum().alias("item_atc_count"),
+        ])
+    )
+
+    conversion_df = (
+        purchase_counts
+        .join(event_hist, on="item_id", how="left")
+        .filter(pl.col("item_purchase_count") >= min_conversion_purchase_count)
+        .with_columns([
+            (
+                pl.col("item_purchase_count")
+                / (pl.col("item_view_count").fill_null(0) + pl.col("item_purchase_count") + 1)
+            ).alias("item_view_to_purchase_rate"),
+            (
+                pl.col("item_purchase_count")
+                / (pl.col("item_atc_count").fill_null(0) + pl.col("item_purchase_count") + 1)
+            ).alias("item_atc_to_purchase_rate"),
+        ])
+        .with_columns(
+            (
+                (
+                    0.6 * pl.col("item_atc_to_purchase_rate")
+                    + 0.4 * pl.col("item_view_to_purchase_rate")
+                )
+                * (pl.col("item_purchase_count").cast(pl.Float32) + 1).log()
+            ).alias("conversion_score")
+        )
+        .sort(["conversion_score", "item_purchase_count", "item_id"], descending=[True, True, False])
+        .limit(max_high_conversion_items)
+        .select(["item_id", "conversion_score"])
+        .collect()
+    )
+
+    items = conversion_df.get_column("item_id").to_list() if conversion_df.height else []
+    score_map = {
+        row["item_id"]: float(row["conversion_score"] or 0.0)
+        for row in conversion_df.to_dicts()
+    }
+    return items, score_map
+
+
 def get_recent_trending_items(transaction_lf, q_hist, n_trend=100, recent_days=60):
     if n_trend == 0:
         return []
@@ -462,6 +723,18 @@ def get_candidates(
     enable_recent_trending=True,
     recent_trending_days=60,
     recent_trending_weight=1.5,
+    enable_repurchase_due_candidates=True,
+    repurchase_due_weight=3.5,
+    max_repurchase_due_items_per_user=20,
+    repurchase_due_min_days=7,
+    repurchase_due_max_days=120,
+    enable_recent_velocity_candidates=True,
+    recent_velocity_weight=1.25,
+    max_recent_velocity_items=200,
+    enable_high_conversion_candidates=True,
+    high_conversion_weight=0.75,
+    max_high_conversion_items=200,
+    min_conversion_purchase_count=5,
 ):
     
     # Setup Temp Folder
@@ -488,8 +761,8 @@ def get_candidates(
     )
     
     # Keep the ranked list for deterministic fallback order; use a set only for membership checks.
-    recent_trend_items_list = [str(x).strip() for x in recent_trend_items_list if x is not None]
-    trend_items_list = [str(x).strip() for x in trend_items_list if x is not None]
+    recent_trend_items_list = [str(x).strip() for x in recent_trend_items_list if x is not None and str(x).strip() not in {"", "(not set)"}]
+    trend_items_list = [str(x).strip() for x in trend_items_list if x is not None and str(x).strip() not in {"", "(not set)"}]
     recent_trend_items_set = set(recent_trend_items_list)
     trend_items_set = set(trend_items_list)
     repeatable_items = _build_repeatable_items(item_lf) if allow_repeat_consumables else set()
@@ -510,6 +783,32 @@ def get_candidates(
             repeatable_items,
             max_repeat_items_per_user=max_repeat_items_per_user,
         )
+    repurchase_due_candidate_map = {}
+    if enable_repurchase_due_candidates:
+        repurchase_due_candidate_map = _build_repurchase_due_candidate_map(
+            transaction_lf,
+            q_hist,
+            repeatable_items,
+            max_repurchase_due_items_per_user=max_repurchase_due_items_per_user,
+            repurchase_due_min_days=repurchase_due_min_days,
+            repurchase_due_max_days=repurchase_due_max_days,
+        )
+    recent_velocity_items_list, recent_velocity_score_map = ([], {})
+    if enable_recent_velocity_candidates:
+        recent_velocity_items_list, recent_velocity_score_map = _build_recent_velocity_candidate_map(
+            transaction_lf,
+            q_hist,
+            max_recent_velocity_items=max_recent_velocity_items,
+        )
+    high_conversion_items_list, high_conversion_score_map = ([], {})
+    if enable_high_conversion_candidates:
+        high_conversion_items_list, high_conversion_score_map = _build_high_conversion_candidate_map(
+            transaction_lf,
+            event_lf,
+            q_hist,
+            max_high_conversion_items=max_high_conversion_items,
+            min_conversion_purchase_count=min_conversion_purchase_count,
+        )
 
     def _is_allowed_repeat(item_id, purchased_items_str):
         if item_id not in purchased_items_str:
@@ -525,13 +824,31 @@ def get_candidates(
         for rank, item in enumerate(recent_trend_items_list, start=1)
     }
 
-    def _candidate_row(cust_id, item_id, rank, score, sources):
+    def _add_source_score(source_scores, item_id, score_name, score):
+        if item_id and item_id != "(not set)":
+            item_scores = source_scores.setdefault(item_id, {})
+            item_scores[score_name] = max(item_scores.get(score_name, 0.0), float(score or 0.0))
+
+    def _global_candidate_score(item):
+        return max(
+            recent_velocity_score_map.get(item, 0.0),
+            recent_trend_rank_score.get(item, 0.0),
+            high_conversion_score_map.get(item, 0.0),
+            trend_rank_score.get(item, 0.0),
+        )
+
+    def _candidate_row(cust_id, item_id, rank, score, sources, source_scores=None):
+        source_scores = source_scores or {}
+        item_source_scores = source_scores.get(item_id, {})
         source_purchase_cf = int("purchase_cf" in sources)
         source_atc_cf = int("atc_cf" in sources)
         source_view_cf = int("view_cf" in sources)
         source_trending = int("trending" in sources)
         source_category_trending = int("category_trending" in sources)
         source_repeat_purchase = int("repeat_purchase" in sources)
+        source_repurchase_due = int("repurchase_due" in sources)
+        source_recent_velocity_30d = int("recent_velocity_30d" in sources)
+        source_high_conversion = int("high_conversion" in sources)
         return {
             "customer_id": cust_id,
             "item_id": item_id,
@@ -543,6 +860,12 @@ def get_candidates(
             "source_trending": source_trending,
             "source_category_trending": source_category_trending,
             "source_repeat_purchase": source_repeat_purchase,
+            "source_repurchase_due": source_repurchase_due,
+            "source_recent_velocity_30d": source_recent_velocity_30d,
+            "source_high_conversion": source_high_conversion,
+            "repurchase_due_source_score": float(item_source_scores.get("repurchase_due_source_score", 0.0)),
+            "recent_velocity_source_score": float(item_source_scores.get("recent_velocity_source_score", 0.0)),
+            "conversion_source_score": float(item_source_scores.get("conversion_source_score", 0.0)),
             "num_candidate_sources": (
                 source_purchase_cf
                 + source_atc_cf
@@ -550,6 +873,9 @@ def get_candidates(
                 + source_trending
                 + source_category_trending
                 + source_repeat_purchase
+                + source_repurchase_due
+                + source_recent_velocity_30d
+                + source_high_conversion
             ),
         }
 
@@ -616,9 +942,39 @@ def get_candidates(
             if (not is_known_user) or (len(recent_purchase_indices) == 0 and len(recent_view_indices) == 0 and len(recent_atc_indices) == 0):
                 ncold_start += 1
                 cold_pool = []
-                for item in recent_trend_items_list + trend_items_list:
-                    if item not in cold_pool and _is_allowed_repeat(item, purchased_items_str):
+                cold_seen = set()
+                cold_sources = {}
+                cold_source_scores = {}
+                blended_global_items = (
+                    recent_velocity_items_list
+                    + recent_trend_items_list
+                    + high_conversion_items_list
+                    + trend_items_list
+                )
+                for item in blended_global_items:
+                    if item in cold_seen or not _is_allowed_repeat(item, purchased_items_str):
+                        continue
+                    if item in recent_velocity_score_map:
+                        cold_sources.setdefault(item, set()).add("recent_velocity_30d")
+                        _add_source_score(
+                            cold_source_scores,
+                            item,
+                            "recent_velocity_source_score",
+                            recent_velocity_score_map.get(item, 0.0),
+                        )
+                    if item in recent_trend_items_set or item in trend_items_set:
+                        cold_sources.setdefault(item, set()).add("trending")
+                    if item in high_conversion_score_map:
+                        cold_sources.setdefault(item, set()).add("high_conversion")
+                        _add_source_score(
+                            cold_source_scores,
+                            item,
+                            "conversion_source_score",
+                            high_conversion_score_map.get(item, 0.0),
+                        )
+                    if item:
                         cold_pool.append(item)
+                        cold_seen.add(item)
                     if len(cold_pool) >= top_n:
                         break
                 final_pool = cold_pool[:top_n]
@@ -627,8 +983,9 @@ def get_candidates(
                         cust_id,
                         item,
                         rank,
-                        recent_trend_rank_score.get(item, trend_rank_score.get(item, 0.0)),
-                        {"trending"},
+                        _global_candidate_score(item),
+                        cold_sources.get(item, set()),
+                        cold_source_scores,
                     )
                     for rank, item in enumerate(final_pool, start=1)
                 ])
@@ -637,6 +994,7 @@ def get_candidates(
             # TÃ¬m Candidates tá»« CF, giá»¯ score Ä‘á»ƒ Æ°u tiÃªn item Ä‘Æ°á»£c gá»£i Ã½ nhiá»u láº§n vÃ  tá»« lá»‹ch sá»­ gáº§n nháº¥t
             rec_pool_score = {}
             rec_pool_sources = {}
+            rec_source_scores = {}
             signal_specs = [
                 (recent_purchase_indices, purchase_seed_weight, "purchase_cf"),
                 (recent_atc_indices, atc_seed_weight, "atc_cf"),
@@ -661,16 +1019,32 @@ def get_candidates(
 
             if not rec_pool_score:
                 rec_pool_score = {
-                    item: recent_trend_rank_score.get(item, trend_rank_score.get(item, 0.0))
-                    for item in (recent_trend_items_list + trend_items_list)
+                    item: _global_candidate_score(item)
+                    for item in (recent_velocity_items_list + recent_trend_items_list + high_conversion_items_list + trend_items_list)
                 }
-                rec_pool_sources = {item: {"trending"} for item in (recent_trend_items_list + trend_items_list)}
+                rec_pool_sources = {}
+                for item in rec_pool_score:
+                    if item in recent_velocity_score_map:
+                        rec_pool_sources.setdefault(item, set()).add("recent_velocity_30d")
+                        _add_source_score(rec_source_scores, item, "recent_velocity_source_score", recent_velocity_score_map.get(item, 0.0))
+                    if item in recent_trend_items_set or item in trend_items_set:
+                        rec_pool_sources.setdefault(item, set()).add("trending")
+                    if item in high_conversion_score_map:
+                        rec_pool_sources.setdefault(item, set()).add("high_conversion")
+                        _add_source_score(rec_source_scores, item, "conversion_source_score", high_conversion_score_map.get(item, 0.0))
 
             if enable_repeat_candidates:
                 for item, repeat_strength in repeat_candidate_map.get(cust_id, []):
                     if item and item != "(not set)":
                         rec_pool_score[item] = rec_pool_score.get(item, 0.0) + (repeat_source_weight * repeat_strength)
                         rec_pool_sources.setdefault(item, set()).add("repeat_purchase")
+
+            if enable_repurchase_due_candidates:
+                for item, due_score in repurchase_due_candidate_map.get(cust_id, []):
+                    if item and item != "(not set)":
+                        rec_pool_score[item] = rec_pool_score.get(item, 0.0) + (repurchase_due_weight * due_score)
+                        rec_pool_sources.setdefault(item, set()).add("repurchase_due")
+                        _add_source_score(rec_source_scores, item, "repurchase_due_source_score", due_score)
 
             if enable_category_trending:
                 for category_key, user_category_strength in user_category_map.get(cust_id, []):
@@ -681,27 +1055,57 @@ def get_candidates(
                             )
                             rec_pool_sources.setdefault(item, set()).add("category_trending")
 
+            if enable_recent_velocity_candidates:
+                for item in recent_velocity_items_list:
+                    source_score = recent_velocity_score_map.get(item, 0.0)
+                    if item and item != "(not set)" and source_score > 0:
+                        rec_pool_score[item] = rec_pool_score.get(item, 0.0) + (recent_velocity_weight * source_score)
+                        rec_pool_sources.setdefault(item, set()).add("recent_velocity_30d")
+                        _add_source_score(rec_source_scores, item, "recent_velocity_source_score", source_score)
+
+            if enable_high_conversion_candidates:
+                for item in high_conversion_items_list:
+                    source_score = high_conversion_score_map.get(item, 0.0)
+                    if item and item != "(not set)" and source_score > 0:
+                        rec_pool_score[item] = rec_pool_score.get(item, 0.0) + (high_conversion_weight * source_score)
+                        rec_pool_sources.setdefault(item, set()).add("high_conversion")
+                        _add_source_score(rec_source_scores, item, "conversion_source_score", source_score)
+
             merged_pool = [
                 item for item, _ in sorted(rec_pool_score.items(), key=lambda x: (-x[1], x[0]))
                 if _is_allowed_repeat(item, purchased_items_str)
             ]
 
             for item in merged_pool:
-                if item in trend_items_set:
+                if item in recent_trend_items_set or item in trend_items_set:
                     rec_pool_sources.setdefault(item, set()).add("trending")
 
             if len(merged_pool) < top_n:
                 seen_pool = set(merged_pool)
-                fallback_items = [
-                    item for item in (recent_trend_items_list + trend_items_list)
-                    if item not in seen_pool and _is_allowed_repeat(item, purchased_items_str)
-                ]
+                fallback_items = []
+                for item in (
+                    recent_velocity_items_list
+                    + recent_trend_items_list
+                    + high_conversion_items_list
+                    + trend_items_list
+                ):
+                    if item in seen_pool or not _is_allowed_repeat(item, purchased_items_str):
+                        continue
+                    fallback_items.append(item)
+                    seen_pool.add(item)
                 for item in fallback_items:
                     rec_pool_score.setdefault(
                         item,
-                        recent_trend_rank_score.get(item, trend_rank_score.get(item, 0.0)),
+                        _global_candidate_score(item),
                     )
-                    rec_pool_sources.setdefault(item, set()).add("trending")
+                    if item in recent_velocity_score_map:
+                        rec_pool_sources.setdefault(item, set()).add("recent_velocity_30d")
+                        _add_source_score(rec_source_scores, item, "recent_velocity_source_score", recent_velocity_score_map.get(item, 0.0))
+                    if item in recent_trend_items_set or item in trend_items_set:
+                        rec_pool_sources.setdefault(item, set()).add("trending")
+                    if item in high_conversion_score_map:
+                        rec_pool_sources.setdefault(item, set()).add("high_conversion")
+                        _add_source_score(rec_source_scores, item, "conversion_source_score", high_conversion_score_map.get(item, 0.0))
                 merged_pool.extend(fallback_items)
 
             final_pool = sorted(
@@ -719,6 +1123,7 @@ def get_candidates(
                     rank,
                     rec_pool_score.get(item, recent_trend_rank_score.get(item, trend_rank_score.get(item, 0.0))),
                     rec_pool_sources.get(item, set()),
+                    rec_source_scores,
                 )
                 for rank, item in enumerate(final_pool, start=1)
             ])
@@ -758,6 +1163,14 @@ def get_candidates(
             "source_trending",
             "source_category_trending",
             "source_repeat_purchase",
+            "source_repurchase_due",
+            "source_recent_velocity_30d",
+            "source_high_conversion",
+        ]
+        source_score_cols = [
+            "repurchase_due_source_score",
+            "recent_velocity_source_score",
+            "conversion_source_score",
         ]
         stats = result_df.select([
             pl.col("candidate_score").mean().alias("score_mean"),
@@ -767,10 +1180,23 @@ def get_candidates(
             (pl.col(c).mean() * 100).alias(f"{c}_pct")
             for c in diag_cols
             if c in result_df.columns
+        ] + [
+            pl.col(c).mean().alias(f"{c}_mean")
+            for c in source_score_cols
+            if c in result_df.columns
+        ] + [
+            pl.col(c).max().alias(f"{c}_max")
+            for c in source_score_cols
+            if c in result_df.columns
         ]).row(0, named=True)
         print(">> Candidate diagnostics:")
         print(f"   candidate_score mean/min/max: {stats['score_mean']:.4f}/{stats['score_min']:.4f}/{stats['score_max']:.4f}")
         for key, value in stats.items():
             if key.endswith("_pct"):
                 print(f"   {key.replace('_pct', '')}: {value:.2f}%")
+        for col in source_score_cols:
+            mean_key = f"{col}_mean"
+            max_key = f"{col}_max"
+            if mean_key in stats and max_key in stats:
+                print(f"   {col} mean/max: {stats[mean_key]:.4f}/{stats[max_key]:.4f}")
     return result_df
