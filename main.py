@@ -19,7 +19,7 @@ warnings.filterwarnings('ignore')
 
 # --- GLOBAL DECLARATION ---
 root_dir = 'data/'
-cache_tag = 'v14a_repurchase_due_only'
+cache_tag = 'v15_lgbm_catboost_blend'
 candidate_cache_tag = 'v14a_repurchase_due_only'
 
 try:
@@ -338,7 +338,9 @@ def main():
             raise ValueError("RUN_MODE must be one of: val, local_test, private")
         print(f">>> RUN_MODE: {run_mode}")
         final_path = "final_submission.parquet" 
-        model_path = f"lgbm_model_{cache_tag}.pkl" 
+        lgb_model_path = f"lgbm_model_{cache_tag}.pkl"
+        cat_model_path = f"catboost_model_{cache_tag}.cbm"
+        blend_config_path = f"blend_config_{cache_tag}.json"
         
         df_final = None
 
@@ -412,7 +414,38 @@ def main():
                 "subsample": 0.8,
                 "colsample_bytree": 0.8,
                 "train_cap": 2_000_000,
+                "enable_catboost_blend": True,
+                "cat_iterations": 1200,
+                "cat_learning_rate": 0.05,
+                "cat_depth": 8,
+                "cat_l2_leaf_reg": 5.0,
+                "cat_loss_function": "YetiRank",
+                "cat_eval_metric": "NDCG:top=10",
+                "cat_random_seed": 42,
+                "cat_od_wait": 50,
+                "blend_weights": [
+                                    1.0,
+                                    0.9,
+                                    0.8,
+                                    0.75,
+                                    0.7,
+                                    0.65,
+                                    0.6,
+                                    0.55,
+                                    0.5,
+                                    0.45,
+                                    0.4,
+                                    0.35,
+                                    0.3,
+                                    0.25,
+                                    0.2,
+                                    0.15,
+                                    0.1,
+                                    0.05,
+                                    0.0,
+                                ],
             }
+            enable_catboost_blend = bool(stage2_cfg.get("enable_catboost_blend", False))
 
             # --- STAGE 1: CANDIDATES ---
             print("\n--- STAGE 1: CANDIDATE GENERATION ---")
@@ -467,6 +500,8 @@ def main():
                 print(f"âœ… Generated {df_candidates.height} candidate records")
                 df_candidates.write_parquet(save_path_s1)
                 print(f"âœ… Saved to {save_path_s1}")
+
+            
 
             # --- STAGE 2: TRAINING ---
             print("\n--- STAGE 2: TRAINING MODEL ---")  
@@ -593,9 +628,44 @@ def main():
                 print(f"Saved to {save_path}")
                 return df
 
-            if os.path.exists(model_path):
-                print(f"âœ… Found existing model: {model_path}")
-                with open(model_path, 'rb') as f: model = pickle.load(f)
+            cat_model = None
+            best_w_lgb = 1.0
+            catboost_blend_ready = False
+            blend_config = {
+                "cache_tag": cache_tag,
+                "candidate_cache_tag": candidate_cache_tag,
+                "best_w_lgb": best_w_lgb,
+                "best_metrics": {},
+            }
+            models_ready = os.path.exists(lgb_model_path)
+            if enable_catboost_blend:
+                models_ready = (
+                    models_ready
+                    and os.path.exists(cat_model_path)
+                    and os.path.exists(blend_config_path)
+                )
+
+            if models_ready:
+                print(f"âœ… Found existing LightGBM model: {lgb_model_path}")
+                with open(lgb_model_path, 'rb') as f:
+                    model = pickle.load(f)
+
+                if enable_catboost_blend:
+                    try:
+                        from catboost import CatBoostRanker
+                    except ImportError as e:
+                        raise ImportError(
+                            "CatBoost dependency is required to load the v15 blend model. "
+                            "Install catboost>=1.2.5 before running the pipeline."
+                        ) from e
+                    print(f"âœ… Found existing CatBoost model: {cat_model_path}")
+                    cat_model = CatBoostRanker()
+                    cat_model.load_model(cat_model_path)
+                    with open(blend_config_path, "r", encoding="utf-8") as f:
+                        blend_config = json.load(f)
+                    best_w_lgb = float(blend_config.get("best_w_lgb", 1.0))
+                    catboost_blend_ready = True
+                    print(f"   Loaded blend weight: w_lgb={best_w_lgb:.2f}")
             else:
                 print(">> Starting Training...")
                 print("\n   [Phase 1/5] Positive Sampling (Train/Val)...")
@@ -620,6 +690,7 @@ def main():
                 _candidate_recall_report(val_candidates, pos_val_df, "val")
                 neg_train_df = rank.negative_sampling(train_candidates, pos_train_df, stage2_cfg)
                 neg_val_df = rank.negative_sampling(val_candidates, pos_val_df, stage2_cfg)
+                
                 print(f"   âœ… Train negatives: {neg_train_df.height}")
                 print(f"   âœ… Val negatives:   {neg_val_df.height}")
                 
@@ -697,6 +768,15 @@ def main():
                     early_stopping_rounds=50
                 )
                 print(f"   âœ… Model training completed")
+
+                if enable_catboost_blend:
+                    cat_model = rank.train_catboost_ranker(
+                        df_train_features,
+                        feature_cols,
+                        stage2_cfg,
+                        df_val=df_val_features,
+                    )
+                    print("   âœ… CatBoost training completed")
                 
                 print("\n   [Validation Report] Ranking on full validation candidate pool...")
                 val_pred_mode = f"val_inference_{cache_tag}"
@@ -716,7 +796,38 @@ def main():
                 )
                 try:
                     df_val_pred = pl.scan_parquet(f"{val_pred_dir}/part_*.parquet").collect()
-                    eval_module.evaluate_predictions_df(df_val_pred, pos_val_df, k=10)
+                    print("\n   [Validation] LightGBM-only:")
+                    lgb_metrics = eval_module.evaluate_predictions_df(df_val_pred, pos_val_df, k=10)
+                    if enable_catboost_blend and cat_model is not None:
+                        cat_scores = rank.predict_catboost(cat_model, df_val_pred, feature_cols)
+                        df_val_pred = df_val_pred.with_columns(
+                            pl.Series("cat_score", cat_scores).cast(pl.Float32)
+                        )
+                        print("\n   [Validation] CatBoost-only:")
+                        eval_module.evaluate_predictions_df(
+                            df_val_pred.with_columns(pl.col("cat_score").alias("pred_score")),
+                            pos_val_df,
+                            k=10,
+                        )
+                        best_w_lgb, best_metrics = rank.grid_search_blend_weight(
+                            df_val_pred,
+                            pos_val_df,
+                            stage2_cfg.get("blend_weights", [1.0]),
+                            eval_module,
+                            k=10,
+                        )
+                        blend_config = {
+                            "cache_tag": cache_tag,
+                            "candidate_cache_tag": candidate_cache_tag,
+                            "best_w_lgb": best_w_lgb,
+                            "best_metrics": best_metrics,
+                        }
+                        with open(blend_config_path, "w", encoding="utf-8") as f:
+                            json.dump(blend_config, f, indent=2)
+                        catboost_blend_ready = True
+                        print(f"   âœ… Saved blend config: {blend_config_path}")
+                    else:
+                        blend_config["best_metrics"] = lgb_metrics
                     del df_val_pred
                 except Exception as e:
                     print(f"   Warning: validation ranking report failed: {e}")
@@ -729,7 +840,11 @@ def main():
                 #     except: pass
                 #     print("="*40)
 
-                with open(model_path, 'wb') as f: pickle.dump(model, f)
+                with open(lgb_model_path, 'wb') as f:
+                    pickle.dump(model, f)
+                if enable_catboost_blend and cat_model is not None:
+                    cat_model.save_model(cat_model_path)
+                    print(f"   âœ… Saved CatBoost model: {cat_model_path}")
                 del df_train_features, df_val_features, df_train_raw, df_val_raw
                 python_gc.collect()
                 if os.path.exists(train_feature_dir): shutil.rmtree(train_feature_dir)
@@ -771,6 +886,24 @@ def main():
             score_max = None
             score_sum = 0.0
             score_count = 0
+            cat_score_min = None
+            cat_score_max = None
+            cat_score_sum = 0.0
+            cat_score_count = 0
+            final_score_min = None
+            final_score_max = None
+            final_score_sum = 0.0
+            final_score_count = 0
+
+            def _score_stats(df_stats, col_name):
+                if col_name not in df_stats.columns:
+                    return None
+                return df_stats.select([
+                    pl.col(col_name).min().alias("min"),
+                    pl.col(col_name).max().alias("max"),
+                    pl.col(col_name).sum().alias("sum"),
+                    pl.col(col_name).count().alias("count"),
+                ]).row(0, named=True)
 
             for i, fpath in enumerate(tqdm(pred_files, desc="Model-first Ranking")):
                 try:
@@ -793,15 +926,41 @@ def main():
                         score_sum += float(score_stats["sum"] or 0.0)
                         score_count += int(score_stats["count"])
 
-                    df_chunk = df_chunk.with_columns(pl.col("pred_score").alias("final_score"))
+                    if enable_catboost_blend and cat_model is not None and catboost_blend_ready:
+                        cat_scores = rank.predict_catboost(cat_model, df_chunk, feature_cols)
+                        df_chunk = df_chunk.with_columns(
+                            pl.Series("cat_score", cat_scores).cast(pl.Float32)
+                        )
+                        cat_stats = _score_stats(df_chunk, "cat_score")
+                        if cat_stats and cat_stats["count"]:
+                            cat_score_min = cat_stats["min"] if cat_score_min is None else min(cat_score_min, cat_stats["min"])
+                            cat_score_max = cat_stats["max"] if cat_score_max is None else max(cat_score_max, cat_stats["max"])
+                            cat_score_sum += float(cat_stats["sum"] or 0.0)
+                            cat_score_count += int(cat_stats["count"])
+                        df_chunk = rank.add_rank_blend_scores(
+                            df_chunk,
+                            lgb_col="pred_score",
+                            cat_col="cat_score",
+                            w_lgb=best_w_lgb,
+                            output_col="final_score",
+                        )
+                    else:
+                        df_chunk = df_chunk.with_columns(pl.col("pred_score").alias("final_score"))
+
+                    final_stats = _score_stats(df_chunk, "final_score")
+                    if final_stats and final_stats["count"]:
+                        final_score_min = final_stats["min"] if final_score_min is None else min(final_score_min, final_stats["min"])
+                        final_score_max = final_stats["max"] if final_score_max is None else max(final_score_max, final_stats["max"])
+                        final_score_sum += float(final_stats["sum"] or 0.0)
+                        final_score_count += int(final_stats["count"])
+
                     sort_cols = ["customer_id", "final_score"]
                     descending = [False, True]
                     for col, desc in [
+                        ("pred_score", True),
+                        ("cat_score", True),
                         ("candidate_score", True),
                         ("candidate_rank", False),
-                        ("atc_match", True),
-                        ("view_item_match", True),
-                        ("item_pop_log", True),
                         ("item_id", False),
                     ]:
                         if col in df_chunk.columns:
@@ -840,12 +999,19 @@ def main():
 
             avg_candidates = prediction_rows_before_top10 / len(prediction_customers) if prediction_customers else 0.0
             score_mean = score_sum / score_count if score_count else 0.0
+            cat_score_mean = cat_score_sum / cat_score_count if cat_score_count else 0.0
+            final_score_mean = final_score_sum / final_score_count if final_score_count else 0.0
             print(">> Stage 3 Diagnostics:")
+            if enable_catboost_blend and cat_model is not None and catboost_blend_ready:
+                print(f"   Blend weight w_lgb: {best_w_lgb:.2f}")
             print(f"   Prediction rows before top-10: {prediction_rows_before_top10}")
             print(f"   Customers with predictions: {len(prediction_customers)}")
             print(f"   Avg candidates/customer before top-10: {avg_candidates:.2f}")
             print(f"   Rows after top-10: {df_final.height}")
             print(f"   Pred score min/max/mean: {score_min}/{score_max}/{score_mean:.6f}")
+            if enable_catboost_blend and cat_model is not None and catboost_blend_ready:
+                print(f"   Cat score min/max/mean: {cat_score_min}/{cat_score_max}/{cat_score_mean:.6f}")
+            print(f"   Final score min/max/mean: {final_score_min}/{final_score_max}/{final_score_mean:.6f}")
             # --- STAGE 3.5: SAFE FALLBACK ---
             print("\n--- STAGE 3.5: FALLBACK (Global Trending) ---")
 
@@ -881,15 +1047,45 @@ def main():
             print(f"   Needing fallback: {len(missing_custs_list)}")
 
             if len(missing_custs_list) > 0:
-                print(f">> Filling with Top 10 Global Trending...")
-                global_pop = gc_module.get_trending_items(
-                    interaction_lf_processed,
-                    queries['inference_feature_history'],
+                print(f">> Filling with Top Recent Purchase Trending...")
+
+                recent_30 = gc_module.get_recent_trending_items(
+                    purchase_lf_processed,
+                    queries["inference_feature_history"],
+                    n_trend=50,
+                    recent_days=30,
+                )
+
+                recent_60 = gc_module.get_recent_trending_items(
+                    purchase_lf_processed,
+                    queries["inference_feature_history"],
+                    n_trend=50,
+                    recent_days=60,
+                )
+
+                global_pop_base = gc_module.get_trending_items(
+                    purchase_lf_processed,
+                    queries["inference_feature_history"],
                     None,
                     n_trend=50,
                     include_val_for_trending=False,
                 )
+
+                # Deduplicate while preserving priority:
+                # recent 30d -> recent 60d -> global purchase trending
+                global_pop = []
+                seen_items = set()
+                for item in recent_30 + recent_60 + global_pop_base:
+                    item = str(item).strip()
+                    if item and item != "(not set)" and item not in seen_items:
+                        global_pop.append(item)
+                        seen_items.add(item)
+                    if len(global_pop) >= 50:
+                        break
+
                 n_pop = len(global_pop)
+                print(f"   Fallback pool size: {n_pop}")
+                print(f"   recent_30={len(recent_30)}, recent_60={len(recent_60)}, global={len(global_pop_base)}")
                 
                 batch_size = 50000
                 fallback_dfs = []

@@ -17,6 +17,13 @@ def _as_lazy_frame(purchase_lf_or_path):
     return purchase_lf_or_path
 
 
+def _lazy_schema_names(lf):
+    try:
+        return lf.collect_schema().names()
+    except AttributeError:
+        return list(lf.schema.keys())
+
+
 def create_groundtruth_from_query(
     purchase_lf_or_path,
     target_query,
@@ -29,7 +36,7 @@ def create_groundtruth_from_query(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     lf = _as_lazy_frame(purchase_lf_or_path)
-    schema_names = lf.collect_schema().names()
+    schema_names = _lazy_schema_names(lf)
 
     if date_col not in schema_names:
         fallback_date_col = next((c for c in ["updated_date", "created_date", "event_date"] if c in schema_names), None)
@@ -44,7 +51,7 @@ def create_groundtruth_from_query(
                 expr.cast(pl.Utf8).str.to_date("%Y-%m-%d", strict=False).cast(pl.Datetime),
             ]).alias(date_col)
         )
-        schema_names = lf.collect_schema().names()
+        schema_names = _lazy_schema_names(lf)
 
     filtered = lf.filter(pl.sql_expr(target_query))
 

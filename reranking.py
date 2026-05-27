@@ -225,3 +225,167 @@ def train_model(df_train, feature_cols, model_name, cfg, df_val=None, early_stop
     print("=" * 60)
 
     return model
+
+
+def train_catboost_ranker(df_train, feature_cols, cfg, df_val=None):
+    try:
+        from catboost import CatBoostRanker, Pool
+    except ImportError as e:
+        raise ImportError(
+            "CatBoost is required for v15_lgbm_catboost_blend. "
+            "Install it with: pip install 'catboost>=1.2.5'"
+        ) from e
+
+    print(">> Training Model: CatBoostRanker...")
+    print("   -> Sorting training rows by customer_id/item_id...")
+    df_train = df_train.sort(["customer_id", "item_id"])
+
+    print("   -> Converting CatBoost training data to Float32...")
+    X_train = df_train.select(feature_cols).fill_null(0).cast(pl.Float32).to_numpy()
+    y_train = df_train.select("target").to_numpy().ravel()
+    group_id_train = df_train.get_column("customer_id").cast(pl.Utf8).to_list()
+
+    train_pool = Pool(
+        data=X_train,
+        label=y_train,
+        group_id=group_id_train,
+        feature_names=feature_cols,
+    )
+
+    eval_set = None
+    if df_val is not None and df_val.height > 0:
+        print("   -> Preparing CatBoost validation pool...")
+        df_val = df_val.sort(["customer_id", "item_id"])
+        X_val = df_val.select(feature_cols).fill_null(0).cast(pl.Float32).to_numpy()
+        y_val = df_val.select("target").to_numpy().ravel()
+        group_id_val = df_val.get_column("customer_id").cast(pl.Utf8).to_list()
+        eval_set = Pool(
+            data=X_val,
+            label=y_val,
+            group_id=group_id_val,
+            feature_names=feature_cols,
+        )
+
+    cat_model = CatBoostRanker(
+        loss_function=cfg.get("cat_loss_function", "YetiRank"),
+        eval_metric=cfg.get("cat_eval_metric", "NDCG:top=10"),
+        iterations=cfg.get("cat_iterations", 1200),
+        learning_rate=cfg.get("cat_learning_rate", 0.05),
+        depth=cfg.get("cat_depth", 8),
+        l2_leaf_reg=cfg.get("cat_l2_leaf_reg", 5.0),
+        random_seed=cfg.get("cat_random_seed", 42),
+        od_type="Iter",
+        od_wait=cfg.get("cat_od_wait", 50),
+        thread_count=-1,
+        verbose=100,
+        allow_writing_files=False,
+    )
+
+    cat_model.fit(train_pool, eval_set=eval_set, use_best_model=eval_set is not None)
+
+    try:
+        print(f"   -> CatBoost best iteration: {cat_model.get_best_iteration()}")
+    except Exception:
+        pass
+
+    try:
+        importance = cat_model.get_feature_importance()
+        imp_df = (
+            pd.DataFrame({"Feature": feature_cols, "Importance": importance})
+            .sort_values(by="Importance", ascending=False)
+            .head(30)
+        )
+        print("\nFEATURE IMPORTANCE (CatBoost Ranker Top 30):")
+        print(imp_df.to_string(index=False))
+    except Exception as e:
+        print(f"   Warning: CatBoost feature importance unavailable: {e}")
+
+    return cat_model
+
+
+def predict_catboost(cat_model, df_features, feature_cols):
+    X = df_features.select(feature_cols).fill_null(0).cast(pl.Float32).to_numpy()
+    scores = np.asarray(cat_model.predict(X), dtype=np.float32)
+    return np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
+def add_rank_blend_scores(
+    df,
+    lgb_col="pred_score",
+    cat_col="cat_score",
+    w_lgb=0.65,
+    output_col="final_score",
+):
+    return (
+        df
+        .with_columns([
+            pl.col(lgb_col).rank("ordinal", descending=True).over("customer_id").alias("_lgb_rank"),
+            pl.col(cat_col).rank("ordinal", descending=True).over("customer_id").alias("_cat_rank"),
+            pl.len().over("customer_id").alias("_candidate_count"),
+        ])
+        .with_columns([
+            (
+                (pl.col("_candidate_count") - pl.col("_lgb_rank") + 1)
+                / pl.col("_candidate_count")
+            ).alias("_lgb_rank_norm"),
+            (
+                (pl.col("_candidate_count") - pl.col("_cat_rank") + 1)
+                / pl.col("_candidate_count")
+            ).alias("_cat_rank_norm"),
+        ])
+        .with_columns(
+            (
+                (w_lgb * pl.col("_lgb_rank_norm"))
+                + ((1.0 - w_lgb) * pl.col("_cat_rank_norm"))
+            ).cast(pl.Float32).alias(output_col)
+        )
+        .drop([
+            "_lgb_rank",
+            "_cat_rank",
+            "_candidate_count",
+            "_lgb_rank_norm",
+            "_cat_rank_norm",
+        ])
+    )
+
+
+def grid_search_blend_weight(df_val_pred, pos_val_df, weights, eval_module, k=10):
+    print("\n>> Blend Weight Grid Search (rank-normalized)")
+    best_w = None
+    best_metrics = None
+    best_key = None
+
+    print("   w_lgb | precision@10 | map | mrr | ndcg | recall@10 | iou")
+    for w in weights:
+        blended = add_rank_blend_scores(
+            df_val_pred,
+            lgb_col="pred_score",
+            cat_col="cat_score",
+            w_lgb=float(w),
+            output_col="final_score",
+        ).with_columns(pl.col("final_score").alias("pred_score"))
+
+        metrics = eval_module.evaluate_predictions_df(blended, pos_val_df, k=k)
+        metric_key = (
+            metrics.get("precision@k", 0.0),
+            metrics.get("map", 0.0),
+            metrics.get("mrr", 0.0),
+            metrics.get("ndcg@k", 0.0),
+        )
+        print(
+            f"   {float(w):.2f} | "
+            f"{metrics.get('precision@k', 0.0):.6f} | "
+            f"{metrics.get('map', 0.0):.6f} | "
+            f"{metrics.get('mrr', 0.0):.6f} | "
+            f"{metrics.get('ndcg@k', 0.0):.6f} | "
+            f"{metrics.get('recall@k', 0.0):.6f} | "
+            f"{metrics.get('iou', 0.0):.6f}"
+        )
+
+        if best_key is None or metric_key > best_key:
+            best_key = metric_key
+            best_w = float(w)
+            best_metrics = metrics
+
+    print(f">> Selected blend weight: w_lgb={best_w:.2f}")
+    return best_w, best_metrics

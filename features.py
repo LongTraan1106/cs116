@@ -16,6 +16,17 @@ except ImportError:
 
 warnings.filterwarnings('ignore')
 
+def _lazy_schema(lf):
+    try:
+        return lf.collect_schema()
+    except AttributeError:
+        return lf.schema
+
+
+def _schema_names(schema):
+    return schema.names() if hasattr(schema, "names") else list(schema.keys())
+
+
 CANDIDATE_FEATURE_DEFAULTS = {
     "candidate_score": 0.0,
     "candidate_rank": 9999,
@@ -97,7 +108,7 @@ PRUNED_FEATURES = {
 # --- 1. PREPARE LOOKUP TABLES (FULL + TIME FEATURES) ---
 def prepare_lookup_tables(transaction_lf, item_lf, q_hist, cfg, event_lf=None):
     print(">> Preparing Lookup Tables (Vectorized)...")
-    item_schema = item_lf.collect_schema().names() if item_lf is not None else []
+    item_schema = _schema_names(_lazy_schema(item_lf)) if item_lf is not None else []
     
     # 1. Filter Data
     hist_lf = (
@@ -678,11 +689,12 @@ def generate_features(
     print(f"   [Feature History] {q_hist}")
 
     try:
-        txn_schema = transaction_lf.collect_schema()
+        txn_schema = _lazy_schema(transaction_lf)
+        txn_schema_names = _schema_names(txn_schema)
         cast_exprs = []
-        if "customer_id" in txn_schema.names():
+        if "customer_id" in txn_schema_names:
             cast_exprs.append(pl.col("customer_id").cast(txn_schema["customer_id"], strict=False))
-        if "item_id" in txn_schema.names():
+        if "item_id" in txn_schema_names:
             cast_exprs.append(pl.col("item_id").cast(txn_schema["item_id"], strict=False))
         if cast_exprs:
             candidates_df = candidates_df.with_columns(cast_exprs)
