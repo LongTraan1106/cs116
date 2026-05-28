@@ -19,7 +19,7 @@ warnings.filterwarnings('ignore')
 
 # --- GLOBAL DECLARATION ---
 root_dir = 'data/'
-cache_tag = 'v15_lgbm_catboost_blend'
+cache_tag = 'v16_candidate_covered_positive'
 candidate_cache_tag = 'v14a_repurchase_due_only'
 
 try:
@@ -228,6 +228,48 @@ def _candidate_recall_report(candidates_df, pos_df, label, ks=(80, 150, 200, 300
         recall = hits.height / total_pos if total_pos else 0.0
         user_hit_rate = hit_users / total_users if total_users else 0.0
         print(f"   Recall@{suffix}: {recall:.6f} | UserHit@{suffix}: {user_hit_rate:.6f} | hits={hits.height}")
+
+
+def _filter_covered_positives(pos_df, candidates_df, label):
+    cand_keys = (
+        candidates_df
+        .select([
+            pl.col("customer_id").cast(pl.Utf8).alias("_customer_id_join"),
+            pl.col("item_id").cast(pl.Utf8).alias("_item_id_join"),
+        ])
+        .unique()
+    )
+
+    pos_with_keys = (
+        pos_df
+        .with_columns([
+            pl.col("customer_id").cast(pl.Utf8).alias("_customer_id_join"),
+            pl.col("item_id").cast(pl.Utf8).alias("_item_id_join"),
+        ])
+    )
+
+    covered = (
+        pos_with_keys
+        .join(cand_keys, on=["_customer_id_join", "_item_id_join"], how="inner")
+        .drop(["_customer_id_join", "_item_id_join"])
+        .unique()
+    )
+
+    total_pos = pos_df.height
+    covered_pos = covered.height
+    total_users = pos_df.select("customer_id").unique().height if total_pos else 0
+    covered_users = covered.select("customer_id").unique().height if covered_pos else 0
+    coverage = covered_pos / total_pos if total_pos else 0.0
+    user_coverage = covered_users / total_users if total_users else 0.0
+
+    print(f"\n[Covered Positive] {label}")
+    print(f"   positives kept: {covered_pos} / {total_pos} ({coverage:.6f})")
+    print(f"   users kept:     {covered_users} / {total_users} ({user_coverage:.6f})")
+
+    if covered_pos == 0:
+        raise ValueError(f"No covered positives found for {label}; check candidate generation.")
+
+    return covered
 
 
 def _print_recommendation_count_stats(df, label):
@@ -688,11 +730,25 @@ def main():
                 )
                 _candidate_recall_report(train_candidates, pos_train_df, "train")
                 _candidate_recall_report(val_candidates, pos_val_df, "val")
-                neg_train_df = rank.negative_sampling(train_candidates, pos_train_df, stage2_cfg)
-                neg_val_df = rank.negative_sampling(val_candidates, pos_val_df, stage2_cfg)
+                pos_train_model_df = _filter_covered_positives(
+                    pos_train_df,
+                    train_candidates,
+                    "train"
+                )
+                pos_val_model_df = _filter_covered_positives(
+                    pos_val_df,
+                    val_candidates,
+                    "val"
+                )
+                neg_train_df = rank.negative_sampling(train_candidates, pos_train_model_df, stage2_cfg)
+                neg_val_df = rank.negative_sampling(val_candidates, pos_val_model_df, stage2_cfg)
                 
                 print(f"   âœ… Train negatives: {neg_train_df.height}")
                 print(f"   âœ… Val negatives:   {neg_val_df.height}")
+                print(f"   Train model positives: {pos_train_model_df.height}")
+                print(f"   Train model negatives: {neg_train_df.height}")
+                print(f"   Val model positives:   {pos_val_model_df.height}")
+                print(f"   Val model negatives:   {neg_val_df.height}")
                 
                 print("\n   [Phase 3/5] Feature Engineering (Train/Val)...")
                 train_target_user_type = pos_train_df.schema["customer_id"]
@@ -713,8 +769,14 @@ def main():
                     pl.col("target").cast(val_target_target_type)
                 ])
 
-                df_train_raw = _attach_candidate_features(pl.concat([pos_train_df, neg_train_df]), train_candidates)
-                df_val_raw = _attach_candidate_features(pl.concat([pos_val_df, neg_val_df]), val_candidates)
+                df_train_raw = _attach_candidate_features(
+                    pl.concat([pos_train_model_df, neg_train_df], how="vertical_relaxed"),
+                    train_candidates
+                )
+                df_val_raw = _attach_candidate_features(
+                    pl.concat([pos_val_model_df, neg_val_df], how="vertical_relaxed"),
+                    val_candidates
+                )
 
                 train_feature_dir = f"temp_features_train_{cache_tag}"
                 val_feature_dir = f"temp_features_val_{cache_tag}"
